@@ -2,6 +2,14 @@
 
 A clean, modern Django 6.1 project configured with Python 3.12 and virtual environment support.
 
+## Customer authentication for the ride-hailing app
+
+Implemented phone/password customer registration and login, JWT refresh rotation,
+logout, and authenticated profile retrieval with PostgreSQL migrations and tests.
+
+See [API documentation and setup (Vietnamese)](docs/customer-auth.md).
+API base path: `/api/auth/`. The root `/` has no application page.
+
 ---
 
 ## Quick Start
