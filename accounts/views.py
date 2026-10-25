@@ -6,10 +6,12 @@ from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenRefreshView
 
+from core.serializers import DriverProfileSerializer
+
 from .models import Customer
 from .serializers import (
-    CustomerRefreshSerializer, CustomerSerializer, LoginSerializer,
-    LogoutSerializer, RegisterSerializer,
+    CustomerRefreshSerializer, CustomerSerializer, DriverLoginSerializer, DriverRegisterSerializer,
+    LoginSerializer, LogoutSerializer, RegisterSerializer,
 )
 
 
@@ -56,6 +58,40 @@ class MeView(generics.RetrieveAPIView):
             return self.request.user.customer
         except Customer.DoesNotExist:
             raise PermissionDenied('Tài khoản không phải khách hàng.')
+
+
+def driver_auth_response(driver):
+    refresh = RefreshToken.for_user(driver.user)
+    return {
+        'driver': DriverProfileSerializer(driver).data,
+        'access': str(refresh.access_token),
+        'refresh': str(refresh),
+    }
+
+
+class DriverRegisterView(PublicAuthView):
+    def post(self, request):
+        serializer = DriverRegisterSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        driver = serializer.save()
+        return Response(driver_auth_response(driver), status=status.HTTP_201_CREATED)
+
+
+class DriverLoginView(PublicAuthView):
+    def post(self, request):
+        serializer = DriverLoginSerializer(data=request.data, context={'request': request})
+        serializer.is_valid(raise_exception=True)
+        return Response(driver_auth_response(serializer.validated_data['driver']))
+
+
+class DriverMeView(generics.RetrieveAPIView):
+    serializer_class = DriverProfileSerializer
+
+    def get_object(self):
+        driver = getattr(self.request.user, 'driver_profile', None)
+        if driver is None:
+            raise PermissionDenied('Tài khoản không phải tài xế.')
+        return driver
 
 
 class LogoutView(APIView):

@@ -118,10 +118,19 @@ class BaseModel(models.Model):
 ```
 *Every entity in new apps should inherit from `BaseModel` to maintain standard UUID keys and audit timestamps.*
 
-### Starter Entity ([`SampleEntity`](file:///c:/Users/huynh/OneDrive/Documents/github/Python%20project/core/models.py))
-- Demonstrates typed fields (`CharField`, `TextField`, `BooleanField`, `JSONField`).
-- Status state choices (`draft`, `active`, `archived`).
-- Registered in [`core/admin.py`](file:///c:/Users/huynh/OneDrive/Documents/github/Python%20project/core/admin.py) with search and filters.
+### Ride domain (GoXe)
+
+`SampleEntity` was removed. The ride-hailing tables now live in `core` (full API contract in
+[`docs/rides-api.md`](docs/rides-api.md); project-wide guide in the root `../AGENTS.md`):
+
+- `accounts.Customer` — customer profile (phone login).
+- `core.DriverProfile` — driver profile, vehicle (`bike`/`car4`/`car7`), status, live location, rating.
+- `core.Ride` — booking: pickup/dropoff (address + lat/lng), fare (int VND), status + step timestamps.
+- `core.Route` — Geoapify road route cache (GeoJSON `LineString`), linked from `Ride.route` and
+  `Ride.approach_route`.
+
+Business logic is in `core/services.py`; realtime (Django Channels) in `core/consumers.py` and
+`core/realtime.py`; Geoapify in `core/routing.py`.
 
 ---
 
@@ -143,10 +152,10 @@ When altering or creating models:
 A custom management command is implemented in [`core/management/commands/seed.py`](file:///c:/Users/huynh/OneDrive/Documents/github/Python%20project/core/management/commands/seed.py):
 
 ```powershell
-# Seed initial demo entities
+# Seed demo customers + online drivers around Quận 1 (password GoXe!2026)
 .\.venv\Scripts\python.exe manage.py seed
 
-# Clear existing records and re-seed fresh records
+# Delete the seeded accounts (and their rides) and re-create them
 .\.venv\Scripts\python.exe manage.py seed --clear
 ```
 

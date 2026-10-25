@@ -1,6 +1,9 @@
 from django.urls import path
 
-from .views import LoginView, LogoutView, MeView, RefreshView, RegisterView
+from .views import (
+    DriverLoginView, DriverMeView, DriverRegisterView, LoginView, LogoutView, MeView, RefreshView,
+    RegisterView,
+)
 
 app_name = 'accounts'
 urlpatterns = [
@@ -9,4 +12,7 @@ urlpatterns = [
     path('refresh/', RefreshView.as_view(), name='refresh'),
     path('logout/', LogoutView.as_view(), name='logout'),
     path('me/', MeView.as_view(), name='me'),
+    path('driver/register/', DriverRegisterView.as_view(), name='driver-register'),
+    path('driver/login/', DriverLoginView.as_view(), name='driver-login'),
+    path('driver/me/', DriverMeView.as_view(), name='driver-me'),
 ]

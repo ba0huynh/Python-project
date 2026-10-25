@@ -37,6 +37,7 @@ ALLOWED_HOSTS = [host.strip() for host in os.getenv('ALLOWED_HOSTS', '*').split(
 # Application definition
 
 INSTALLED_APPS = [
+    'daphne',  # must be first: runserver then serves HTTP + WebSocket (ASGI)
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -48,6 +49,7 @@ INSTALLED_APPS = [
     'accounts',
     'rest_framework',
     'rest_framework_simplejwt.token_blacklist',
+    'channels',
 ]
 
 MIDDLEWARE = [
@@ -78,6 +80,7 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'config.wsgi.application'
+ASGI_APPLICATION = 'config.asgi.application'
 
 
 # Database
@@ -181,3 +184,28 @@ MAILERS = {
         'BACKEND': 'django.core.mail.backends.console.EmailBackend',
     },
 }
+
+
+# Realtime (Django Channels)
+# In-memory layer works for a single server process (enough for dev / demo).
+# For several processes set REDIS_URL and `pip install channels-redis`.
+REDIS_URL = os.getenv('REDIS_URL', '')
+if REDIS_URL:
+    CHANNEL_LAYERS = {
+        'default': {
+            'BACKEND': 'channels_redis.core.RedisChannelLayer',
+            'CONFIG': {'hosts': [REDIS_URL]},
+        }
+    }
+else:
+    CHANNEL_LAYERS = {'default': {'BACKEND': 'channels.layers.InMemoryChannelLayer'}}
+
+
+# Ride settings
+# Geoapify routing key: https://myprojects.geoapify.com (free tier). Empty = straight-line fallback.
+GEOAPIFY_API_KEY = os.getenv('GEOAPIFY_API_KEY', '')
+GEOAPIFY_TIMEOUT = float(os.getenv('GEOAPIFY_TIMEOUT', '10'))
+# Drivers within this distance of the pickup get the ride request.
+DRIVER_SEARCH_RADIUS_KM = float(os.getenv('DRIVER_SEARCH_RADIUS_KM', '5'))
+# New drivers are approved automatically (school project). Set False to approve them in /admin.
+DRIVER_AUTO_APPROVE = os.getenv('DRIVER_AUTO_APPROVE', 'True').lower() in ('true', '1', 'yes')

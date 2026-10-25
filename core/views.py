@@ -1,69 +1,159 @@
-from rest_framework import status
-from rest_framework.views import APIView
+from django.db.models import Q
+from rest_framework import permissions, status
 from rest_framework.response import Response
-from .models import DriverProfile, Ride
-from .serializers import DriverProfileSerializer, RideSerializer
+from rest_framework.views import APIView
+
+from . import services
+from .models import Ride
+from .serializers import (
+    CancelSerializer, CreateRideSerializer, DriverProfileSerializer, DriverStatusSerializer,
+    EstimateOptionSerializer, EstimateRequestSerializer, LocationSerializer, RateSerializer,
+    RideSerializer, RideStatusSerializer,
+)
+
+RIDE_RELATED = ('customer__customer', 'driver', 'route', 'approach_route')
 
 
-class UpdateDriverStatusView(APIView):
-    def patch(self, request, driver_id):
-        try:
-            driver = DriverProfile.objects.get(id=driver_id)
-        except DriverProfile.DoesNotExist:
-            return Response({"error": "Không tìm thấy tài xế"}, status=status.HTTP_404_NOT_FOUND)
-        
-        serializer = DriverProfileSerializer(driver, data=request.data, partial=True)
-        if serializer.is_valid():
-            serializer.save()
-            return Response({"message": "Cập nhật thành công", "data": serializer.data})
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+class IsCustomer(permissions.BasePermission):
+    message = 'Chỉ khách hàng mới dùng được chức năng này.'
+
+    def has_permission(self, request, view):
+        return services.is_customer(request.user)
 
 
-class AvailableRidesView(APIView):
+class IsDriver(permissions.BasePermission):
+    message = 'Chỉ tài xế mới dùng được chức năng này.'
+
+    def has_permission(self, request, view):
+        return services.get_driver(request.user) is not None
+
+
+def validated(serializer_class, request):
+    s = serializer_class(data=request.data)
+    s.is_valid(raise_exception=True)
+    return s.validated_data
+
+
+# --- Customer -----------------------------------------------------------------
+
+class RideEstimateView(APIView):
+    """POST /api/rides/estimate/ -> road route + fare for each vehicle type."""
+
+    def post(self, request):
+        data = validated(EstimateRequestSerializer, request)
+        options = services.estimate(data['pickup'], data['dropoff'])
+        return Response({'options': EstimateOptionSerializer(options, many=True).data})
+
+
+class RideListCreateView(APIView):
+    """GET: my rides (customer or driver). POST (customer): book a ride."""
+
     def get(self, request):
-        pending_rides = Ride.objects.filter(status='PENDING')
-        serializer = RideSerializer(pending_rides, many=True)
-        return Response({"total": pending_rides.count(), "rides": serializer.data}, status=status.HTTP_200_OK)
+        driver = services.get_driver(request.user)
+        q = Q(customer=request.user)
+        if driver:
+            q |= Q(driver=driver)
+        rides = Ride.objects.filter(q).select_related(*RIDE_RELATED)[:50]
+        return Response(RideSerializer(rides, many=True).data)
+
+    def post(self, request):
+        if not services.is_customer(request.user):
+            return Response({'detail': IsCustomer.message}, status=status.HTTP_403_FORBIDDEN)
+        data = validated(CreateRideSerializer, request)
+        ride = services.create_ride(request.user, data['vehicle_type'], data['pickup'], data['dropoff'])
+        return Response(RideSerializer(ride).data, status=status.HTTP_201_CREATED)
 
 
-class AcceptRideView(APIView):
+class CurrentRideView(APIView):
+    """GET /api/rides/current/ -> the active ride of this user, or null."""
+
+    def get(self, request):
+        driver = services.get_driver(request.user)
+        q = Q(customer=request.user, status__in=Ride.ACTIVE_STATUSES)
+        if driver:
+            q |= Q(driver=driver, status__in=services.DRIVER_ACTIVE_STATUSES)
+        ride = Ride.objects.filter(q).select_related(*RIDE_RELATED).first()
+        return Response({'ride': RideSerializer(ride).data if ride else None})
+
+
+class RideDetailView(APIView):
+    def get(self, request, ride_id):
+        driver = services.get_driver(request.user)
+        q = Q(customer=request.user)
+        if driver:
+            # Drivers may also look at pending rides they are being offered.
+            q |= Q(driver=driver) | Q(status='PENDING', vehicle_type=driver.vehicle_type)
+        ride = Ride.objects.filter(q, pk=ride_id).select_related(*RIDE_RELATED).first()
+        if ride is None:
+            return Response({'detail': 'Không tìm thấy chuyến đi.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(RideSerializer(ride).data)
+
+
+class CancelRideView(APIView):
     def post(self, request, ride_id):
-        driver_id = request.data.get('driver_id')
-        try:
-            ride = Ride.objects.get(id=ride_id, status='PENDING')
-            driver = DriverProfile.objects.get(id=driver_id)
-        except (Ride.DoesNotExist, DriverProfile.DoesNotExist):
-            return Response({"error": "Cuốc xe không hợp lệ hoặc đã có người nhận"}, status=status.HTTP_400_BAD_REQUEST)
-        
-        ride.driver = driver
-        ride.status = 'ACCEPTED'
-        ride.save()
-
-        driver.status = 'BUSY'
-        driver.save()
-
-        return Response({
-            "message": "Nhận chuyến thành công!",
-            "ride": RideSerializer(ride).data
-        }, status=status.HTTP_200_OK)
+        data = validated(CancelSerializer, request)
+        ride = services.cancel_ride(request.user, ride_id, data['reason'])
+        return Response(RideSerializer(ride).data)
 
 
-class UpdateRideStatusView(APIView):
+class RateRideView(APIView):
+    permission_classes = [permissions.IsAuthenticated, IsCustomer]
+
+    def post(self, request, ride_id):
+        data = validated(RateSerializer, request)
+        ride = services.rate_ride(request.user, ride_id, data['rating'], data['comment'])
+        return Response(RideSerializer(ride).data)
+
+
+# --- Driver -------------------------------------------------------------------
+
+class DriverOnlyView(APIView):
+    permission_classes = [permissions.IsAuthenticated, IsDriver]
+
+    @property
+    def driver(self):
+        return services.get_driver(self.request.user)
+
+
+class UpdateDriverStatusView(DriverOnlyView):
+    """PATCH /api/driver/status/ {status: ONLINE|OFFLINE, lat?, lng?}"""
+
+    def patch(self, request):
+        data = validated(DriverStatusSerializer, request)
+        driver = services.set_driver_status(
+            self.driver, data['status'] == 'ONLINE', data.get('lat'), data.get('lng')
+        )
+        return Response(DriverProfileSerializer(driver).data)
+
+
+class DriverLocationView(DriverOnlyView):
+    """POST /api/driver/location/ {lat, lng}. The WebSocket does the same, prefer it."""
+
+    def post(self, request):
+        data = validated(LocationSerializer, request)
+        services.update_driver_location(self.driver, data['lat'], data['lng'])
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class AvailableRidesView(DriverOnlyView):
+    """GET /api/driver/rides/available/ -> pending rides near me, closest first."""
+
+    def get(self, request):
+        rides = services.available_rides_for(self.driver)
+        data = [{**RideSerializer(r).data, 'distance_to_pickup_m': int(d)} for d, r in rides]
+        return Response({'total': len(data), 'rides': data})
+
+
+class AcceptRideView(DriverOnlyView):
+    def post(self, request, ride_id):
+        ride = services.accept_ride(self.driver, ride_id)
+        return Response(RideSerializer(ride).data)
+
+
+class UpdateRideStatusView(DriverOnlyView):
+    """PATCH /api/driver/rides/<id>/update-status/ {status: ARRIVED|IN_PROGRESS|COMPLETED}"""
+
     def patch(self, request, ride_id):
-        new_status = request.data.get('status')
-        try:
-            ride = Ride.objects.get(id=ride_id)
-        except Ride.DoesNotExist:
-            return Response({"error": "Không tìm thấy chuyến đi"}, status=status.HTTP_404_NOT_FOUND)
-        
-        if new_status in ['IN_PROGRESS', 'COMPLETED', 'CANCELLED']:
-            ride.status = new_status
-            ride.save()
-
-            if new_status == 'COMPLETED' and ride.driver:
-                ride.driver.status = 'ONLINE'
-                ride.driver.save()
-
-            return Response({"message": "Cập nhật trạng thái thành công", "ride": RideSerializer(ride).data})
-        
-        return Response({"error": "Trạng thái mới không hợp lệ"}, status=status.HTTP_400_BAD_REQUEST)
+        data = validated(RideStatusSerializer, request)
+        ride = services.advance_ride(self.driver, ride_id, data['status'])
+        return Response(RideSerializer(ride).data)
