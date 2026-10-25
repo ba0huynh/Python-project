@@ -1,10 +1,15 @@
 from django.contrib import admin
-from .models import SampleEntity
+from .models import DriverProfile, Ride
 
+# Đăng ký các model mới lên trang quản trị Admin của Django
+@admin.register(DriverProfile)
+class DriverProfileAdmin(admin.ModelAdmin):
+    list_display = ('user', 'vehicle_plate', 'vehicle_type', 'status', 'is_approved')
+    list_filter = ('status', 'is_approved', 'vehicle_type')
+    search_fields = ('user__username', 'license_number', 'vehicle_plate')
 
-@admin.register(SampleEntity)
-class SampleEntityAdmin(admin.ModelAdmin):
-    list_display = ('title', 'status', 'is_active', 'created_at', 'updated_at')
-    list_filter = ('status', 'is_active', 'created_at')
-    search_fields = ('title', 'description')
-    readonly_fields = ('id', 'created_at', 'updated_at')
+@admin.register(Ride)
+class RideAdmin(admin.ModelAdmin):
+    list_display = ('id', 'customer', 'driver', 'pickup_location', 'dropoff_location', 'fare', 'status')
+    list_filter = ('status',)
+    search_fields = ('customer__username', 'pickup_location', 'dropoff_location')
