@@ -209,3 +209,4 @@ GEOAPIFY_TIMEOUT = float(os.getenv('GEOAPIFY_TIMEOUT', '10'))
 DRIVER_SEARCH_RADIUS_KM = float(os.getenv('DRIVER_SEARCH_RADIUS_KM', '5'))
 # New drivers are approved automatically (school project). Set False to approve them in /admin.
 DRIVER_AUTO_APPROVE = os.getenv('DRIVER_AUTO_APPROVE', 'True').lower() in ('true', '1', 'yes')
+
