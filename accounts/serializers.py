@@ -73,11 +73,15 @@ class LoginSerializer(serializers.Serializer):
     validate_phone = staticmethod(normalize_phone)
 
     def validate(self, data):
+        if not Customer.objects.filter(user__username=data['phone']).exists():
+            raise serializers.ValidationError(
+                'Số điện thoại này chưa có tài khoản khách hàng. Vui lòng đăng ký.'
+            )
         user = authenticate(
             request=self.context.get('request'), username=data['phone'], password=data['password']
         )
-        if user is None or not Customer.objects.filter(user=user).exists():
-            raise serializers.ValidationError('Số điện thoại hoặc mật khẩu không đúng.')
+        if user is None:
+            raise serializers.ValidationError('Mật khẩu không đúng. Vui lòng thử lại.')
         return {'customer': user.customer}
 
 
@@ -154,12 +158,16 @@ class DriverLoginSerializer(serializers.Serializer):
     validate_phone = staticmethod(normalize_phone)
 
     def validate(self, data):
+        username = driver_username(data['phone'])
+        if not DriverProfile.objects.filter(user__username=username).exists():
+            raise serializers.ValidationError(
+                'Số điện thoại này chưa có tài khoản tài xế. Vui lòng đăng ký.'
+            )
         user = authenticate(
-            request=self.context.get('request'),
-            username=driver_username(data['phone']), password=data['password'],
+            request=self.context.get('request'), username=username, password=data['password'],
         )
-        if user is None or not DriverProfile.objects.filter(user=user).exists():
-            raise serializers.ValidationError('Số điện thoại hoặc mật khẩu không đúng.')
+        if user is None:
+            raise serializers.ValidationError('Mật khẩu không đúng. Vui lòng thử lại.')
         return {'driver': user.driver_profile}
 
 
