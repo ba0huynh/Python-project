@@ -4,7 +4,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from . import services
-from .models import Ride
+from .models import DriverProfile, Ride
 from .serializers import (
     CancelSerializer, CreateRideSerializer, DriverProfileSerializer, DriverStatusSerializer,
     EstimateOptionSerializer, EstimateRequestSerializer, LocationSerializer, RateSerializer,
@@ -157,3 +157,37 @@ class UpdateRideStatusView(DriverOnlyView):
         data = validated(RideStatusSerializer, request)
         ride = services.advance_ride(self.driver, ride_id, data['status'])
         return Response(RideSerializer(ride).data)
+
+
+class AutoAcceptRideView(APIView):
+    """Assign the nearest available online driver to this pending ride."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, ride_id):
+        ride = Ride.objects.filter(pk=ride_id, status='PENDING').first()
+        if not ride:
+            return Response({'detail': 'Không tìm thấy chuyến xe đang chờ.'}, status=status.HTTP_404_NOT_FOUND)
+        drivers = services.nearby_drivers(ride.pickup_lat, ride.pickup_lng, ride.vehicle_type)
+        if not drivers:
+            driver = DriverProfile.objects.filter(status='ONLINE', vehicle_type=ride.vehicle_type, is_approved=True).first()
+            if not driver:
+                return Response({'detail': 'Không có tài xế nào trực tuyến gần đây.'}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            driver = drivers[0][1]
+        accepted_ride = services.accept_ride(driver, ride.id)
+        return Response(RideSerializer(accepted_ride).data)
+
+
+class AutoAdvanceRideView(APIView):
+    """Advance ride status (ARRIVED, IN_PROGRESS, COMPLETED) using its assigned driver."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, ride_id):
+        ride = Ride.objects.filter(pk=ride_id).first()
+        if not ride or not ride.driver:
+            return Response({'detail': 'Chuyến đi chưa có tài xế.'}, status=status.HTTP_400_BAD_REQUEST)
+        next_status = services.DRIVER_TRANSITIONS.get(ride.status)
+        if not next_status:
+            return Response({'detail': f'Không thể chuyển tiếp từ {ride.status}.'}, status=status.HTTP_400_BAD_REQUEST)
+        advanced_ride = services.advance_ride(ride.driver, ride.id, next_status[0])
+        return Response(RideSerializer(advanced_ride).data)

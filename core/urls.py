@@ -3,7 +3,7 @@ from django.urls import path
 from .views import (
     AcceptRideView, AvailableRidesView, CancelRideView, CurrentRideView, DriverLocationView,
     RateRideView, RideDetailView, RideEstimateView, RideListCreateView, UpdateDriverStatusView,
-    UpdateRideStatusView,
+    UpdateRideStatusView, AutoAcceptRideView, AutoAdvanceRideView,
 )
 
 # Mounted at /api/ in config/urls.py
@@ -15,6 +15,8 @@ urlpatterns = [
     path('rides/<uuid:ride_id>/', RideDetailView.as_view(), name='ride-detail'),
     path('rides/<uuid:ride_id>/cancel/', CancelRideView.as_view(), name='ride-cancel'),
     path('rides/<uuid:ride_id>/rate/', RateRideView.as_view(), name='ride-rate'),
+    path('rides/<uuid:ride_id>/auto-accept/', AutoAcceptRideView.as_view(), name='ride-auto-accept'),
+    path('rides/<uuid:ride_id>/auto-advance/', AutoAdvanceRideView.as_view(), name='ride-auto-advance'),
     # Driver
     path('driver/status/', UpdateDriverStatusView.as_view(), name='update-driver-status'),
     path('driver/location/', DriverLocationView.as_view(), name='driver-location'),
