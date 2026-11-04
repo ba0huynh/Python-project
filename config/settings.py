@@ -50,9 +50,11 @@ INSTALLED_APPS = [
     'rest_framework',
     'rest_framework_simplejwt.token_blacklist',
     'channels',
+    'corsheaders',
 ]
 
 MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -209,3 +211,7 @@ GEOAPIFY_TIMEOUT = float(os.getenv('GEOAPIFY_TIMEOUT', '10'))
 DRIVER_SEARCH_RADIUS_KM = float(os.getenv('DRIVER_SEARCH_RADIUS_KM', '5'))
 # New drivers are approved automatically (school project). Set False to approve them in /admin.
 DRIVER_AUTO_APPROVE = os.getenv('DRIVER_AUTO_APPROVE', 'True').lower() in ('true', '1', 'yes')
+
+# CORS
+CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_CREDENTIALS = True

@@ -11,7 +11,7 @@ from core.serializers import DriverProfileSerializer
 from .models import Customer
 from .serializers import (
     CustomerRefreshSerializer, CustomerSerializer, DriverLoginSerializer, DriverRegisterSerializer,
-    LoginSerializer, LogoutSerializer, RegisterSerializer,
+    LoginSerializer, LogoutSerializer, RegisterSerializer, ResetPasswordSerializer,
 )
 
 
@@ -106,3 +106,14 @@ class LogoutView(APIView):
         except TokenError:
             raise ValidationError({'refresh': 'Token không hợp lệ hoặc đã hết hạn.'})
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class ResetPasswordView(PublicAuthView):
+    def post(self, request):
+        serializer = ResetPasswordSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(
+            {'detail': 'Đặt lại mật khẩu thành công. Vui lòng đăng nhập bằng mật khẩu mới.'},
+            status=status.HTTP_200_OK,
+        )

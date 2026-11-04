@@ -165,3 +165,46 @@ class DriverLoginSerializer(serializers.Serializer):
 
 class LogoutSerializer(serializers.Serializer):
     refresh = serializers.CharField()
+
+
+class ResetPasswordSerializer(serializers.Serializer):
+    phone = serializers.CharField(max_length=20)
+    role = serializers.ChoiceField(choices=['customer', 'driver'], default='customer')
+    otp = serializers.CharField(max_length=10, default='1234', required=False)
+    new_password = serializers.CharField(write_only=True, trim_whitespace=False, max_length=128)
+    new_password_confirm = serializers.CharField(write_only=True, trim_whitespace=False, max_length=128)
+
+    validate_phone = staticmethod(normalize_phone)
+
+    def validate(self, data):
+        otp = data.get('otp', '1234')
+        if not otp:
+            otp = '1234'
+        if otp.strip() != '1234':
+            raise serializers.ValidationError({'otp': 'Mã OTP không đúng. Mã mặc định là 1234.'})
+
+        if data['new_password'] != data['new_password_confirm']:
+            raise serializers.ValidationError({'new_password_confirm': 'Mật khẩu xác nhận không khớp.'})
+
+        role = data.get('role', 'customer')
+        username = driver_username(data['phone']) if role == 'driver' else data['phone']
+
+        try:
+            user = User.objects.get(username=username)
+        except User.DoesNotExist:
+            role_label = 'tài xế' if role == 'driver' else 'khách hàng'
+            raise serializers.ValidationError({'phone': f'Số điện thoại này chưa được đăng ký làm {role_label}.'})
+
+        try:
+            validate_password(data['new_password'], user=user)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError({'new_password': exc.messages})
+
+        data['user'] = user
+        return data
+
+    def save(self):
+        user = self.validated_data['user']
+        user.set_password(self.validated_data['new_password'])
+        user.save()
+        return user

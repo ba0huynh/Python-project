@@ -125,3 +125,49 @@ class CustomerAuthTests(APITestCase):
         self.assertEqual(self.client.post('/api/auth/login/', {
             'phone': '0912345678', 'password': 'wrong',
         }, format='json').status_code, 429)
+
+    def test_reset_password_success_and_login(self):
+        self.register()
+        cache.clear()
+        # Reset password with default OTP 1234
+        res = self.client.post('/api/auth/reset-password/', {
+            'phone': '0912345678',
+            'role': 'customer',
+            'otp': '1234',
+            'new_password': 'NewPassword!2026',
+            'new_password_confirm': 'NewPassword!2026',
+        }, format='json')
+        self.assertEqual(res.status_code, 200, res.data)
+
+        # Login with new password
+        cache.clear()
+        login_res = self.client.post('/api/auth/login/', {
+            'phone': '0912345678',
+            'password': 'NewPassword!2026',
+        }, format='json')
+        self.assertEqual(login_res.status_code, 200, login_res.data)
+
+    def test_reset_password_invalid_otp_or_phone(self):
+        self.register()
+        cache.clear()
+        # Invalid OTP
+        res = self.client.post('/api/auth/reset-password/', {
+            'phone': '0912345678',
+            'role': 'customer',
+            'otp': '9999',
+            'new_password': 'NewPassword!2026',
+            'new_password_confirm': 'NewPassword!2026',
+        }, format='json')
+        self.assertEqual(res.status_code, 400)
+        self.assertIn('otp', res.data)
+
+        # Unregistered phone
+        res2 = self.client.post('/api/auth/reset-password/', {
+            'phone': '0988888888',
+            'role': 'customer',
+            'otp': '1234',
+            'new_password': 'NewPassword!2026',
+            'new_password_confirm': 'NewPassword!2026',
+        }, format='json')
+        self.assertEqual(res2.status_code, 400)
+        self.assertIn('phone', res2.data)
