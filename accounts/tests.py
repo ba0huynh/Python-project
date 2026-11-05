@@ -125,3 +125,67 @@ class CustomerAuthTests(APITestCase):
         self.assertEqual(self.client.post('/api/auth/login/', {
             'phone': '0912345678', 'password': 'wrong',
         }, format='json').status_code, 429)
+
+
+
+class AdminRegistrationAndApprovalTests(APITestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(username='admin', is_staff=True, is_superuser=True)
+        self.driver_user = get_user_model().objects.create_user(username='driver:+84901234567')
+        from core.models import DriverProfile
+        self.driver = DriverProfile.objects.create(
+            user=self.driver_user,
+            phone='+84901234567',
+            full_name='Nguyen Van Driver',
+            license_number='LIC-12345',
+            vehicle_plate='59A-12345',
+            vehicle_type='bike',
+            is_approved=False,
+            status='OFFLINE',
+        )
+
+    def test_admin_classes_registered(self):
+        from django.contrib.admin.sites import site
+        from core.models import DriverProfile
+        self.assertIn(Customer, site._registry)
+        self.assertIn(DriverProfile, site._registry)
+
+    def test_approve_selected_drivers_action_success(self):
+        from .admin import DriverProfileAdmin
+        from core.models import DriverProfile
+        from django.contrib.admin.sites import site
+        from unittest.mock import MagicMock
+
+        admin_instance = DriverProfileAdmin(DriverProfile, site)
+        admin_instance.message_user = MagicMock()
+        request = MagicMock()
+        queryset = DriverProfile.objects.filter(pk=self.driver.pk)
+
+        admin_instance.approve_selected_drivers(request, queryset)
+
+        self.driver.refresh_from_db()
+        self.assertTrue(self.driver.is_approved)
+        self.assertEqual(self.driver.status, 'OFFLINE')
+        admin_instance.message_user.assert_called_once()
+        args, kwargs = admin_instance.message_user.call_args
+        self.assertIn("Thành công: Đã phê duyệt 1 tài xế", args[1])
+
+    def test_approve_selected_drivers_action_warning_when_none_pending(self):
+        from .admin import DriverProfileAdmin
+        from core.models import DriverProfile
+        from django.contrib.admin.sites import site
+        from unittest.mock import MagicMock
+
+        self.driver.is_approved = True
+        self.driver.save()
+
+        admin_instance = DriverProfileAdmin(DriverProfile, site)
+        admin_instance.message_user = MagicMock()
+        request = MagicMock()
+        queryset = DriverProfile.objects.filter(pk=self.driver.pk)
+
+        admin_instance.approve_selected_drivers(request, queryset)
+
+        admin_instance.message_user.assert_called_once()
+        args, kwargs = admin_instance.message_user.call_args
+        self.assertIn("Không có tài xế nào được duyệt", args[1])

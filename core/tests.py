@@ -213,6 +213,7 @@ class RideFlowTests(APITestCase):
         self.assertIn('distance_to_pickup_m', msg['data'])
 
 
+@override_settings(DRIVER_AUTO_APPROVE=True)
 class DriverAuthTests(APITestCase):
     payload = {
         'phone': '0901234567', 'full_name': 'Trần Văn Bình', 'password': 'RideSecure!2026',
@@ -287,3 +288,238 @@ class WebSocketTests(TransactionTestCase):
         async_to_sync(run)()
         driver.refresh_from_db()
         self.assertEqual(driver.current_latitude, 10.776)
+
+
+class AdminRideSummaryTests(TransactionTestCase):
+    def test_summary_changelist_empty(self):
+        from django.contrib import admin
+        from django.test import RequestFactory
+        from core.models import RideSummary
+        from core.admin import RideSummaryAdmin
+
+        admin_site = admin.AdminSite()
+        model_admin = RideSummaryAdmin(RideSummary, admin_site)
+
+        rf = RequestFactory()
+        request = rf.get('/admin/core/ridesummary/')
+        request.user = User.objects.create_superuser('admin_kpi_test', 'kpi@test.com', 'pass')
+
+        cl = model_admin.get_changelist_instance(request)
+        self.assertEqual(len(cl.result_list), 0)
+
+    def test_summary_changelist_with_data(self):
+        from django.contrib import admin
+        from django.test import RequestFactory
+        from core.models import RideSummary
+        from core.admin import RideSummaryAdmin
+
+        admin_site = admin.AdminSite()
+        model_admin = RideSummaryAdmin(RideSummary, admin_site)
+
+        d1 = make_driver(phone='+84909990001', vehicle_type='bike')
+        d2 = make_driver(phone='+84909990002', vehicle_type='car4')
+        customer = make_customer(phone='+84909990003')
+
+        # 1 completed bike ride
+        Ride.objects.create(
+            customer=customer, driver=d1, vehicle_type='bike', status='COMPLETED', fare=50000,
+            pickup_address='A', pickup_lat=10.77, pickup_lng=106.69,
+            dropoff_address='B', dropoff_lat=10.79, dropoff_lng=106.72,
+        )
+
+        # 1 cancelled bike ride
+        Ride.objects.create(
+            customer=customer, driver=d1, vehicle_type='bike', status='CANCELLED', fare=20000,
+            pickup_address='A', pickup_lat=10.77, pickup_lng=106.69,
+            dropoff_address='B', dropoff_lat=10.79, dropoff_lng=106.72,
+        )
+
+        # 1 completed car4 ride
+        Ride.objects.create(
+            customer=customer, driver=d2, vehicle_type='car4', status='COMPLETED', fare=120000,
+            pickup_address='A', pickup_lat=10.77, pickup_lng=106.69,
+            dropoff_address='B', dropoff_lat=10.79, dropoff_lng=106.72,
+        )
+
+        rf = RequestFactory()
+        request = rf.get('/admin/core/ridesummary/')
+        request.user = User.objects.create_superuser('admin_kpi_test2', 'kpi2@test.com', 'pass')
+
+        cl = model_admin.get_changelist_instance(request)
+        self.assertEqual(len(cl.result_list), 2)
+
+        # Find bike row
+        bike_row = next(r for r in cl.result_list if r.vehicle_type == 'bike')
+        self.assertEqual(bike_row.total_rides, 2)
+        self.assertEqual(bike_row.completed_rides, 1)
+        self.assertEqual(bike_row.cancelled_rides, 1)
+        self.assertEqual(bike_row.total_revenue, 50000)
+
+        # Find car4 row
+        car4_row = next(r for r in cl.result_list if r.vehicle_type == 'car4')
+        self.assertEqual(car4_row.total_rides, 1)
+        self.assertEqual(car4_row.completed_rides, 1)
+        self.assertEqual(car4_row.cancelled_rides, 0)
+        self.assertEqual(car4_row.total_revenue, 120000)
+
+        # Permissions check
+        self.assertFalse(model_admin.has_add_permission(request))
+        self.assertFalse(model_admin.has_delete_permission(request))
+        self.assertFalse(model_admin.has_change_permission(request))
+
+
+class CustomAdminFilterTests(TransactionTestCase):
+    def test_fare_range_and_distance_filters(self):
+        from django.contrib import admin
+        from django.test import RequestFactory
+        from core.models import Ride
+        from core.admin import FareRangeFilter, DistanceFilter, RideAdmin
+
+        admin_site = admin.AdminSite()
+        model_admin = RideAdmin(Ride, admin_site)
+        rf = RequestFactory()
+
+        customer = make_customer(phone='+84909111222')
+        driver = make_driver(phone='+84909333444')
+
+        # low fare (<50k), short distance (<5km)
+        r1 = Ride.objects.create(
+            customer=customer, driver=driver, fare=30000, distance_m=3000,
+            pickup_address='A', pickup_lat=10.77, pickup_lng=106.69,
+            dropoff_address='B', dropoff_lat=10.79, dropoff_lng=106.72,
+        )
+        # medium fare (50k-100k), long distance (>=5km)
+        r2 = Ride.objects.create(
+            customer=customer, driver=driver, fare=75000, distance_m=8000,
+            pickup_address='A', pickup_lat=10.77, pickup_lng=106.69,
+            dropoff_address='B', dropoff_lat=10.79, dropoff_lng=106.72,
+        )
+        # high fare (>100k), long distance (>=5km)
+        r3 = Ride.objects.create(
+            customer=customer, driver=driver, fare=150000, distance_m=12000,
+            pickup_address='A', pickup_lat=10.77, pickup_lng=106.69,
+            dropoff_address='B', dropoff_lat=10.79, dropoff_lng=106.72,
+        )
+
+        base_qs = Ride.objects.filter(id__in=[r1.id, r2.id, r3.id])
+
+        # Test FareRangeFilter: low
+        req_low = rf.get('/admin/core/ride/?fare_range=low')
+        f_low = FareRangeFilter(req_low, req_low.GET.copy(), Ride, model_admin)
+        self.assertEqual(list(f_low.queryset(req_low, base_qs)), [r1])
+
+        # Test FareRangeFilter: medium
+        req_med = rf.get('/admin/core/ride/?fare_range=medium')
+        f_med = FareRangeFilter(req_med, req_med.GET.copy(), Ride, model_admin)
+        self.assertEqual(list(f_med.queryset(req_med, base_qs)), [r2])
+
+        # Test FareRangeFilter: high
+        req_high = rf.get('/admin/core/ride/?fare_range=high')
+        f_high = FareRangeFilter(req_high, req_high.GET.copy(), Ride, model_admin)
+        self.assertEqual(list(f_high.queryset(req_high, base_qs)), [r3])
+
+        # Test DistanceFilter: short
+        req_short = rf.get('/admin/core/ride/?distance=short')
+        d_short = DistanceFilter(req_short, req_short.GET.copy(), Ride, model_admin)
+        self.assertEqual(list(d_short.queryset(req_short, base_qs)), [r1])
+
+        # Test DistanceFilter: long
+        req_long = rf.get('/admin/core/ride/?distance=long')
+        d_long = DistanceFilter(req_long, req_long.GET.copy(), Ride, model_admin)
+        self.assertCountEqual(list(d_long.queryset(req_long, base_qs)), [r2, r3])
+
+    def test_bad_rating_filter(self):
+        from django.contrib import admin
+        from django.test import RequestFactory
+        from core.models import Ride
+        from core.admin import BadRatingFilter, RideAdmin
+
+        admin_site = admin.AdminSite()
+        model_admin = RideAdmin(Ride, admin_site)
+        rf = RequestFactory()
+
+        customer = make_customer(phone='+84909555666')
+        driver = make_driver(phone='+84909777888')
+
+        # 1-star bad rating
+        r_bad = Ride.objects.create(
+            customer=customer, driver=driver, fare=30000, distance_m=3000,
+            status='COMPLETED', rating=1, rating_comment='Very bad attitude',
+            pickup_address='A', pickup_lat=10.77, pickup_lng=106.69,
+            dropoff_address='B', dropoff_lat=10.79, dropoff_lng=106.72,
+        )
+        # 5-star good rating
+        r_good = Ride.objects.create(
+            customer=customer, driver=driver, fare=50000, distance_m=5000,
+            status='COMPLETED', rating=5, rating_comment='Excellent',
+            pickup_address='A', pickup_lat=10.77, pickup_lng=106.69,
+            dropoff_address='B', dropoff_lat=10.79, dropoff_lng=106.72,
+        )
+        # Completed but unrated
+        r_unrated = Ride.objects.create(
+            customer=customer, driver=driver, fare=40000, distance_m=4000,
+            status='COMPLETED', rating=None,
+            pickup_address='A', pickup_lat=10.77, pickup_lng=106.69,
+            dropoff_address='B', dropoff_lat=10.79, dropoff_lng=106.72,
+        )
+        # Cancelled (unrated but not completed)
+        r_cancelled = Ride.objects.create(
+            customer=customer, driver=driver, fare=20000, distance_m=2000,
+            status='CANCELLED', rating=None,
+            pickup_address='A', pickup_lat=10.77, pickup_lng=106.69,
+            dropoff_address='B', dropoff_lat=10.79, dropoff_lng=106.72,
+        )
+
+        base_qs = Ride.objects.filter(id__in=[r_bad.id, r_good.id, r_unrated.id, r_cancelled.id])
+
+        from core.admin import RatingFilter
+        # Test 1 star
+        req_1 = rf.get('/admin/core/ride/?rating=1')
+        f_1 = RatingFilter(req_1, req_1.GET.copy(), Ride, model_admin)
+        self.assertEqual(list(f_1.queryset(req_1, base_qs)), [r_bad])
+
+        # Test 5 stars
+        req_5 = rf.get('/admin/core/ride/?rating=5')
+        f_5 = RatingFilter(req_5, req_5.GET.copy(), Ride, model_admin)
+        self.assertEqual(list(f_5.queryset(req_5, base_qs)), [r_good])
+
+        # Test unrated
+        req_unrated = rf.get('/admin/core/ride/?rating=unrated')
+        f_unrated = RatingFilter(req_unrated, req_unrated.GET.copy(), Ride, model_admin)
+        self.assertCountEqual(list(f_unrated.queryset(req_unrated, base_qs)), [r_unrated, r_cancelled])
+
+        # Readonly fields check
+        self.assertIn('rating', model_admin.readonly_fields)
+        self.assertIn('rating_comment', model_admin.readonly_fields)
+
+    def test_ride_admin_export_csv_action(self):
+        from django.contrib import admin
+        from django.test import RequestFactory
+        from core.admin import RideAdmin
+
+        admin_site = admin.AdminSite()
+        model_admin = RideAdmin(Ride, admin_site)
+        rf = RequestFactory()
+
+        customer = make_customer(phone='+84909111222')
+        driver = make_driver(phone='+84909333444')
+        ride = Ride.objects.create(
+            customer=customer, driver=driver, fare=35000, distance_m=3500,
+            status='COMPLETED', rating=5, rating_comment='Rat hai long',
+            pickup_address='Ben Thanh', pickup_lat=10.77, pickup_lng=106.69,
+            dropoff_address='Pho di bo', dropoff_lat=10.79, dropoff_lng=106.72,
+        )
+
+        req = rf.post('/admin/core/ride/')
+        req.user = customer
+        response = model_admin.export_selected_rides_to_csv(req, Ride.objects.filter(id=ride.id))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response['Content-Type'], 'text/csv; charset=utf-8')
+        self.assertIn('attachment; filename="goxe_rides_', response['Content-Disposition'])
+
+        content = response.content.decode('utf-8-sig')
+        self.assertIn('Ride ID,Created At', content)
+        self.assertIn('Ben Thanh', content)
+        self.assertIn('Rat hai long', content)
+        self.assertIn('35,000 VND', content)

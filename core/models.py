@@ -20,14 +20,14 @@ class BaseModel(models.Model):
 
 class VehicleType(models.TextChoices):
     # Must match VEHICLES in mobile/src/lib/mock.ts and core/pricing.py
-    BIKE = 'bike', 'GoBike (xe máy)'
-    CAR4 = 'car4', 'GoCar 4 chỗ'
-    CAR7 = 'car7', 'GoCar 7 chỗ'
+    BIKE = 'bike', 'GoBike'
+    CAR4 = 'car4', 'GoCar 4 Seats'
+    CAR7 = 'car7', 'GoCar 7 Seats'
 
 
 class DriverProfile(BaseModel):
     """
-    Model quản lý thông tin chi tiết của Tài xế.
+    Model for managing driver details.
     """
     STATUS_CHOICES = [
         ('OFFLINE', 'Offline'),
@@ -36,18 +36,18 @@ class DriverProfile(BaseModel):
     ]
 
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='driver_profile')
-    phone = models.CharField(max_length=12, unique=True, help_text="Số điện thoại (+84...)")
+    phone = models.CharField(max_length=12, unique=True, help_text="Phone number (+84...)")
     full_name = models.CharField(max_length=150, default='')
-    license_number = models.CharField(max_length=50, unique=True, help_text="Số bằng lái xe")
-    vehicle_plate = models.CharField(max_length=20, help_text="Biển số xe")
+    license_number = models.CharField(max_length=50, unique=True, help_text="Driving license number")
+    vehicle_plate = models.CharField(max_length=20, help_text="Vehicle license plate")
     vehicle_type = models.CharField(
         max_length=10, choices=VehicleType.choices, default=VehicleType.BIKE, db_index=True
     )
-    vehicle_name = models.CharField(max_length=100, blank=True, default='', help_text="VD: Honda Vision · Đỏ")
-    is_approved = models.BooleanField(default=False, help_text="Trạng thái duyệt của Admin")
+    vehicle_name = models.CharField(max_length=100, blank=True, default='', help_text="e.g. Honda Vision · Red")
+    is_approved = models.BooleanField(default=False, help_text="Admin approval status")
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='OFFLINE', db_index=True)
-    current_latitude = models.FloatField(null=True, blank=True, help_text="Vĩ độ GPS hiện tại")
-    current_longitude = models.FloatField(null=True, blank=True, help_text="Kinh độ GPS hiện tại")
+    current_latitude = models.FloatField(null=True, blank=True, help_text="Current GPS latitude")
+    current_longitude = models.FloatField(null=True, blank=True, help_text="Current GPS longitude")
     location_updated_at = models.DateTimeField(null=True, blank=True)
     rating = models.FloatField(default=5.0)
 
@@ -56,7 +56,7 @@ class DriverProfile(BaseModel):
         verbose_name_plural = "Driver Profiles"
 
     def __str__(self):
-        return f"Tài xế {self.full_name or self.user.username} - {self.status}"
+        return f"{self.full_name or self.user.username} - {self.status}"
 
 
 class Route(BaseModel):
@@ -69,7 +69,7 @@ class Route(BaseModel):
     """
     PROVIDER_CHOICES = [
         ('geoapify', 'Geoapify'),
-        ('straight_line', 'Đường thẳng (dự phòng)'),
+        ('straight_line', 'Straight-line estimate'),
     ]
 
     mode = models.CharField(max_length=20, help_text="Geoapify mode: motorcycle / drive")
@@ -79,7 +79,7 @@ class Route(BaseModel):
     to_lng = models.FloatField()
     distance_m = models.PositiveIntegerField()
     duration_s = models.PositiveIntegerField()
-    geometry = models.JSONField(help_text="GeoJSON LineString, toạ độ [lng, lat]")
+    geometry = models.JSONField(help_text="GeoJSON LineString, coordinates [lng, lat]")
     provider = models.CharField(max_length=20, choices=PROVIDER_CHOICES, default='geoapify')
 
     class Meta:
@@ -95,27 +95,27 @@ class Route(BaseModel):
 
 class Ride(BaseModel):
     """
-    Model quản lý thông tin chuyến đi đặt xe.
+    Model for managing ride bookings.
     """
     STATUS_CHOICES = [
-        ('PENDING', 'Chờ tài xế'),
-        ('ACCEPTED', 'Đã nhận cuốc'),
-        ('ARRIVED', 'Tài xế đã đến điểm đón'),
-        ('IN_PROGRESS', 'Đang chở khách'),
-        ('COMPLETED', 'Hoàn thành'),
-        ('CANCELLED', 'Đã hủy'),
+        ('PENDING', 'Pending'),
+        ('ACCEPTED', 'Accepted'),
+        ('ARRIVED', 'Arrived'),
+        ('IN_PROGRESS', 'In Progress'),
+        ('COMPLETED', 'Completed'),
+        ('CANCELLED', 'Cancelled'),
     ]
     ACTIVE_STATUSES = ('PENDING', 'ACCEPTED', 'ARRIVED', 'IN_PROGRESS')
-    CANCELLED_BY_CHOICES = [('customer', 'Khách hàng'), ('driver', 'Tài xế'), ('system', 'Hệ thống')]
+    CANCELLED_BY_CHOICES = [('customer', 'Customer'), ('driver', 'Driver'), ('system', 'System')]
 
     customer = models.ForeignKey(User, on_delete=models.CASCADE, related_name='customer_rides')
     driver = models.ForeignKey(DriverProfile, on_delete=models.SET_NULL, null=True, blank=True, related_name='driver_rides')
     vehicle_type = models.CharField(max_length=10, choices=VehicleType.choices, default=VehicleType.BIKE)
 
-    pickup_address = models.CharField(max_length=255, help_text="Điểm đón")
+    pickup_address = models.CharField(max_length=255, help_text="Pickup address")
     pickup_lat = models.FloatField()
     pickup_lng = models.FloatField()
-    dropoff_address = models.CharField(max_length=255, help_text="Điểm trả")
+    dropoff_address = models.CharField(max_length=255, help_text="Dropoff address")
     dropoff_lat = models.FloatField()
     dropoff_lng = models.FloatField()
 
@@ -127,8 +127,16 @@ class Ride(BaseModel):
     )
     distance_m = models.PositiveIntegerField(default=0)
     duration_s = models.PositiveIntegerField(default=0)
-    fare = models.PositiveIntegerField(help_text="Cước phí chuyến đi (VND)")
-    payment_method = models.CharField(max_length=20, default='cash')
+    PAYMENT_METHOD_CHOICES = [
+        ('cash', 'Cash'),
+        ('wallet', 'Wallet'),
+        ('card', 'Credit/Debit Card'),
+    ]
+
+    fare = models.PositiveIntegerField(help_text="Ride fare (VND)")
+    payment_method = models.CharField(
+        max_length=20, choices=PAYMENT_METHOD_CHOICES, default='cash'
+    )
 
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING', db_index=True)
     accepted_at = models.DateTimeField(null=True, blank=True)
@@ -139,7 +147,7 @@ class Ride(BaseModel):
     cancelled_by = models.CharField(max_length=10, choices=CANCELLED_BY_CHOICES, blank=True, default='')
     cancel_reason = models.CharField(max_length=255, blank=True, default='')
 
-    rating = models.PositiveSmallIntegerField(null=True, blank=True, help_text="Khách đánh giá tài xế (1-5)")
+    rating = models.PositiveSmallIntegerField(null=True, blank=True, help_text="Rating 1-5")
     rating_comment = models.CharField(max_length=500, blank=True, default='')
 
     class Meta:
@@ -148,4 +156,16 @@ class Ride(BaseModel):
         ordering = ['-created_at']
 
     def __str__(self):
-        return f"Cuốc #{self.id} - {self.status}"
+        return f"Ride #{self.id} - {self.status}"
+
+
+class RideSummary(Ride):
+    """
+    Proxy model for the operations dashboard and analytics reporting.
+    Does not create a separate database table.
+    """
+    class Meta:
+        proxy = True
+        verbose_name = "Ride Summary & Analytics"
+        verbose_name_plural = "Rides Summary & Analytics"
+
