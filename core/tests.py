@@ -693,3 +693,26 @@ class CustomAdminFilterTests(TransactionTestCase):
         self.assertIn('Ben Thanh', content)
         self.assertIn('Rat hai long', content)
         self.assertIn(',35000,', content)
+
+
+class SeedCommandTests(TransactionTestCase):
+    def test_seed_is_idempotent_across_redeploys(self):
+        from io import StringIO
+        from django.core.management import call_command
+
+        call_command('seed', force=True, stdout=StringIO())
+        initial_rides = Ride.objects.count()
+        initial_drivers = DriverProfile.objects.count()
+        self.assertGreater(initial_rides, 0)
+        self.assertEqual(initial_drivers, 15)
+        self.assertTrue(User.objects.filter(username='admin1', is_superuser=True).exists())
+
+        driver = DriverProfile.objects.first()
+        driver.status = 'OFFLINE'
+        driver.save(update_fields=['status'])
+
+        call_command('seed', force=True, stdout=StringIO())
+        self.assertEqual(Ride.objects.count(), initial_rides)
+        self.assertEqual(DriverProfile.objects.count(), initial_drivers)
+        driver.refresh_from_db()
+        self.assertEqual(driver.status, 'OFFLINE')

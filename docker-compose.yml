@@ -37,7 +37,6 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-django_db}
       REDIS_URL: redis://redis:6379/0
       USE_SQLITE: "False"
-    command: sh -c "python manage.py migrate --noinput && daphne -b 0.0.0.0 -p 8000 --proxy-headers config.asgi:application"
     ports:
       - "8000:8000"
     depends_on:
@@ -59,7 +58,8 @@ services:
     healthcheck:
       disable: true
     depends_on:
-      - web
+      web:
+        condition: service_healthy
 
 volumes:
   postgres_data:

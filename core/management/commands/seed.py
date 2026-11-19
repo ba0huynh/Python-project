@@ -161,7 +161,7 @@ class Command(BaseCommand):
             User.objects.filter(username__in=seeded_customer_phones + driver_usernames).delete()
             self.stdout.write(self.style.WARNING('Cleared existing rides, logs, and demo users.'))
 
-        # 1. Create Customers
+        # 1. Create Customers (idempotent: don't overwrite existing profiles on redeploy)
         created_customers = []
         for c in CUSTOMERS_DATA:
             user, created = User.objects.get_or_create(username=c['phone'])
@@ -169,24 +169,24 @@ class Command(BaseCommand):
                 user.set_password(PASSWORD)
                 user.first_name = c['full_name']
                 user.save()
-            customer, _ = Customer.objects.update_or_create(
+            customer, _ = Customer.objects.get_or_create(
                 user=user,
-                defaults={'phone': c['phone'], 'full_name': c['full_name']}
+                defaults={'phone': c['phone'], 'full_name': c['full_name']},
             )
             created_customers.append((user, customer))
-        self.stdout.write(self.style.SUCCESS(f'Created {len(created_customers)} Customers.'))
+        self.stdout.write(self.style.SUCCESS(f'Ensured {len(created_customers)} Customers.'))
 
-        # 2. Create Drivers
+        # 2. Create Drivers (idempotent: keep live status/approval/location on redeploy)
         created_drivers = []
         for d in DRIVERS_DATA:
             user, created = User.objects.get_or_create(
                 username=f"driver:{d['phone']}",
-                defaults={'first_name': d['full_name']}
+                defaults={'first_name': d['full_name']},
             )
             if created:
                 user.set_password(PASSWORD)
                 user.save()
-            driver, _ = DriverProfile.objects.update_or_create(
+            driver, _ = DriverProfile.objects.get_or_create(
                 user=user,
                 defaults={
                     'phone': d['phone'],
@@ -201,12 +201,36 @@ class Command(BaseCommand):
                     'current_longitude': d['lng'],
                     'location_updated_at': timezone.now() if d['lat'] else None,
                     'rating': d['rating'],
-                }
+                },
             )
             created_drivers.append(driver)
-        self.stdout.write(self.style.SUCCESS(f'Created {len(created_drivers)} Drivers (including pending reviews).'))
+        self.stdout.write(self.style.SUCCESS(f'Ensured {len(created_drivers)} Drivers (including pending reviews).'))
 
-        # 3. Create 40 Realistic Rides
+        # 3. Create 40 Realistic Rides (only when no rides exist yet, unless --clear was used)
+        if Ride.objects.exists():
+            self.stdout.write('Rides already exist; skipping demo ride creation (use --clear to reset).')
+        else:
+            self._seed_rides(created_customers, created_drivers)
+
+        # Ensure demo superuser admin1 exists
+        admin_user, created_admin = User.objects.get_or_create(username='admin1')
+        if created_admin:
+            admin_user.set_password(PASSWORD)
+            admin_user.is_superuser = True
+            admin_user.is_staff = True
+            admin_user.first_name = 'Admin'
+            admin_user.save()
+            self.stdout.write(self.style.SUCCESS(f'Superuser "admin1" created (password: {PASSWORD}).'))
+
+        self.stdout.write(self.style.SUCCESS(
+            f'\n=== Seeding Finished Successfully! ===\n'
+            f'- Total Customers: {Customer.objects.count()}\n'
+            f'- Total Drivers: {DriverProfile.objects.count()}\n'
+            f'- Total Rides: {Ride.objects.count()}\n'
+            f'- Password for all accounts: {PASSWORD}\n'
+        ))
+
+    def _seed_rides(self, created_customers, created_drivers):
         self.stdout.write('Generating 40 realistic rides across services and date ranges...')
         approved_drivers = [d for d in created_drivers if d.is_approved]
         now = timezone.now()
@@ -495,21 +519,3 @@ class Command(BaseCommand):
 
         Ride.objects.bulk_create(rides_to_create)
         self.stdout.write(self.style.SUCCESS(f'Created {len(rides_to_create)} Rides.'))
-
-        # Ensure demo superuser admin1 exists
-        admin_user, created_admin = User.objects.get_or_create(username='admin1')
-        if created_admin:
-            admin_user.set_password(PASSWORD)
-            admin_user.is_superuser = True
-            admin_user.is_staff = True
-            admin_user.first_name = 'Admin'
-            admin_user.save()
-            self.stdout.write(self.style.SUCCESS(f'Superuser "admin1" created (password: {PASSWORD}).'))
-
-        self.stdout.write(self.style.SUCCESS(
-            f'\n=== Seeding Finished Successfully! ===\n'
-            f'- Total Customers: {Customer.objects.count()}\n'
-            f'- Total Drivers: {DriverProfile.objects.count()}\n'
-            f'- Total Rides: {Ride.objects.count()}\n'
-            f'- Password for all accounts: {PASSWORD}\n'
-        ))
