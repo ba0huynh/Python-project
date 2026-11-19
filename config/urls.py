@@ -1,20 +1,6 @@
-"""
-URL configuration for config project.
-
-The `urlpatterns` list routes URLs to views. For more information please see:
-    https://docs.djangoproject.com/en/6.1/topics/http/urls/
-Examples:
-Function views
-    1. Add an import:  from my_app import views
-    2. Add a URL to urlpatterns:  path('', views.home, name='home')
-Class-based views
-    1. Add an import:  from other_app.views import Home
-    2. Add a URL to urlpatterns:  path('', Home.as_view(), name='home')
-Including another URLconf
-    1. Import the include() function: from django.urls import include, path
-    2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
-"""
+"""URL configuration: /admin/, /api/auth/ (accounts), /api/ (rides, driver, places)."""
 from django.contrib import admin
+from django.http import JsonResponse
 from django.urls import include, path
 
 urlpatterns = [
@@ -22,3 +8,16 @@ urlpatterns = [
     path('api/auth/', include('accounts.urls')),
     path('api/', include('core.urls')),
 ]
+
+
+# JSON errors instead of HTML pages (used when DEBUG is off).
+def not_found(request, exception=None):
+    return JsonResponse({'detail': 'Không tìm thấy.'}, status=404)
+
+
+def server_error(request):
+    return JsonResponse({'detail': 'Lỗi máy chủ. Vui lòng thử lại sau.'}, status=500)
+
+
+handler404 = not_found
+handler500 = server_error

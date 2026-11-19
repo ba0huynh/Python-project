@@ -1,16 +1,66 @@
+# Local development:  docker compose up -d            -> Postgres + Redis only (run Django from .venv)
+# Full stack:         docker compose --profile app up -d --build
+#                     -> + web (daphne, :8000) + ride worker, using be/.env
 services:
   postgres:
     image: postgres:16-alpine
     container_name: django_postgres
     restart: unless-stopped
     environment:
-      POSTGRES_DB: django_db
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-django_db}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: goxe_redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+
+  web:
+    profiles: ["app"]
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-django_db}
+      REDIS_URL: redis://redis:6379/0
+      USE_SQLITE: "False"
+    command: sh -c "python manage.py migrate --noinput && daphne -b 0.0.0.0 -p 8000 --proxy-headers config.asgi:application"
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  worker:
+    profiles: ["app"]
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-django_db}
+      REDIS_URL: redis://redis:6379/0
+      USE_SQLITE: "False"
+    command: python manage.py ride_worker
+    healthcheck:
+      disable: true
+    depends_on:
+      - web
 
 volumes:
   postgres_data:
+  redis_data:

@@ -123,14 +123,18 @@ class BaseModel(models.Model):
 `SampleEntity` was removed. The ride-hailing tables now live in `core` (full API contract in
 [`docs/rides-api.md`](docs/rides-api.md); project-wide guide in the root `../AGENTS.md`):
 
-- `accounts.Customer` — customer profile (phone login).
-- `core.DriverProfile` — driver profile, vehicle (`bike`/`car4`/`car7`), status, live location, rating.
-- `core.Ride` — booking: pickup/dropoff (address + lat/lng), fare (int VND), status + step timestamps.
+- `accounts.Customer` — customer profile (phone login). `accounts.PhoneOTP` — hashed SMS codes.
+- `core.FareRule` — price list per vehicle type (base fare, per km, minimum, commission %), edited in /admin.
+- `core.DriverProfile` — driver profile, vehicle (`bike`/`car4`/`car7`), approval, status, live location + heading, rating.
+- `core.Ride` — booking: pickup/dropoff, fare + commission + driver earning (fixed at booking), status + step timestamps.
+- `core.RideOffer` — a ride offered to one driver (15 s to accept); drives the dispatcher.
 - `core.Route` — Geoapify road route cache (GeoJSON `LineString`), linked from `Ride.route` and
   `Ride.approach_route`.
 
 Business logic is in `core/services.py`; realtime (Django Channels) in `core/consumers.py` and
-`core/realtime.py`; Geoapify in `core/routing.py`.
+`core/realtime.py`; Geoapify in `core/routing.py` (routes) and `core/geocoding.py` (places);
+dispatcher loop in `core/management/commands/ride_worker.py` (or embedded in the web process when
+there is no Redis). Production deployment: `Dockerfile` + `docker-compose.yml` (`--profile app`).
 
 ---
 
@@ -152,7 +156,8 @@ When altering or creating models:
 A custom management command is implemented in [`core/management/commands/seed.py`](file:///c:/Users/huynh/OneDrive/Documents/github/Python%20project/core/management/commands/seed.py):
 
 ```powershell
-# Seed demo customers + online drivers around Quận 1 (password GoXe!2026)
+# Seed test customers + online drivers around Quận 1 (password GoXe!2026). DEV ONLY:
+# refuses to run when DEBUG is off.
 .\.venv\Scripts\python.exe manage.py seed
 
 # Delete the seeded accounts (and their rides) and re-create them

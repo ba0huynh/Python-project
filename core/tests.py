@@ -1,3 +1,5 @@
+from datetime import timedelta
+from decimal import Decimal
 from unittest import mock
 
 from asgiref.sync import async_to_sync
@@ -5,15 +7,18 @@ from channels.layers import get_channel_layer
 from channels.testing import WebsocketCommunicator
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
-from django.test import TransactionTestCase, override_settings
+from django.test import TestCase, TransactionTestCase, override_settings
+from django.utils import timezone
 from rest_framework.test import APIClient, APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from accounts.models import Customer
+from accounts.tests import request_otp
 from config.asgi import application
 
-from .models import DriverProfile, Ride, Route
-from .pricing import estimate_fare
+from . import services
+from .models import DriverProfile, FareRule, Ride, RideOffer, Route
+from .pricing import quote
 
 User = get_user_model()
 
@@ -45,12 +50,14 @@ def make_customer(phone='+84912345678'):
     return user
 
 
-def make_driver(phone='+84901234567', vehicle_type='bike', lat=10.7752, lng=106.7010, status='ONLINE'):
+def make_driver(phone='+84901234567', vehicle_type='bike', lat=10.7735, lng=106.6990, status='ONLINE',
+                approved=True, seen_ago=0):
     user = User.objects.create_user(username=f'driver:{phone}', password='x')
     return DriverProfile.objects.create(
         user=user, phone=phone, full_name='Tài xế ' + phone[-2:], license_number='L' + phone,
-        vehicle_plate='59X-' + phone[-4:], vehicle_type=vehicle_type, is_approved=True, status=status,
+        vehicle_plate='59X-' + phone[-4:], vehicle_type=vehicle_type, is_approved=approved, status=status,
         current_latitude=lat, current_longitude=lng,
+        location_updated_at=timezone.now() - timedelta(seconds=seen_ago),
     )
 
 
@@ -60,48 +67,80 @@ def client_for(user):
     return c
 
 
+class PricingTests(TestCase):
+    def rule(self, **kw):
+        defaults = dict(vehicle_type='bike', display_name='X', base_fare=12_000, base_km=Decimal('2'),
+                        per_km=4_500, minimum_fare=15_000, commission_percent=Decimal('20'))
+        return FareRule(**{**defaults, **kw})
+
+    def test_fare_by_km_with_minimum_rounding_and_commission(self):
+        q = quote(self.rule(), 4200)  # 12.000 + 2.2 km * 4.500 = 21.900 -> 22.000
+        self.assertEqual((q.fare, q.commission, q.driver_earning), (22_000, 4_000, 18_000))
+        self.assertEqual(quote(self.rule(), 500).fare, 15_000)  # short trip -> minimum fare
+        self.assertEqual(quote(self.rule(commission_percent=Decimal('0')), 4200).driver_earning, 22_000)
+
+    def test_initial_rules_exist(self):
+        self.assertEqual(set(FareRule.objects.values_list('vehicle_type', flat=True)), {'bike', 'car4', 'car7'})
+
+
 @override_settings(GEOAPIFY_API_KEY='test-key')
-class RoutingTests(APITestCase):
+class EstimateTests(APITestCase):
     def setUp(self):
-        self.customer = make_customer()
-        self.api = client_for(self.customer)
+        cache.clear()
+        self.api = client_for(make_customer())
+
+    def estimate(self, pickup=PICKUP, dropoff=DROPOFF):
+        return self.api.post('/api/rides/estimate/', {'pickup': pickup, 'dropoff': dropoff}, format='json')
 
     @mock.patch('core.routing.requests.get', return_value=geoapify_response())
-    def test_estimate_returns_route_per_vehicle_and_caches(self, get):
-        r = self.api.post('/api/rides/estimate/', {'pickup': PICKUP, 'dropoff': DROPOFF}, format='json')
+    def test_estimate_uses_fare_rules_and_caches_routes(self, get):
+        make_driver()
+        make_driver('+84909999999', seen_ago=600)  # stale GPS: not counted
+        r = self.estimate()
         self.assertEqual(r.status_code, 200, r.data)
         options = {o['vehicle_type']: o for o in r.data['options']}
         self.assertEqual(set(options), {'bike', 'car4', 'car7'})
-        self.assertEqual(options['bike']['fare'], estimate_fare('bike', 4200))
-        route = options['bike']['route']
-        self.assertEqual(route['provider'], 'geoapify')
-        self.assertEqual(route['geometry']['type'], 'LineString')
-        # Legs merged, shared point not duplicated
-        self.assertEqual(len(route['geometry']['coordinates']), 4)
-        # One call per mode (motorcycle, drive), then served from the Route table
-        self.assertEqual(get.call_count, 2)
-        self.api.post('/api/rides/estimate/', {'pickup': PICKUP, 'dropoff': DROPOFF}, format='json')
+        bike = options['bike']
+        self.assertEqual(bike['fare'], quote(FareRule.objects.get(vehicle_type='bike'), 4200).fare)
+        self.assertEqual((bike['distance_m'], bike['duration_s'], bike['drivers_nearby']), (4200, 780, 1))
+        self.assertEqual(options['car4']['drivers_nearby'], 0)
+        self.assertEqual(len(bike['route']['geometry']['coordinates']), 4)  # legs merged
+        self.assertEqual(get.call_count, 2)  # motorcycle + drive, then cached
+        self.estimate()
         self.assertEqual(get.call_count, 2)
         self.assertEqual(Route.objects.count(), 2)
-        params = get.call_args.kwargs['params']
-        self.assertEqual(params['waypoints'], '10.7725,106.6981|10.795,106.7219')
+
+    @mock.patch('core.routing.requests.get', return_value=geoapify_response())
+    def test_admin_price_change_and_disabled_type(self, _get):
+        FareRule.objects.filter(vehicle_type='bike').update(base_fare=50_000, minimum_fare=0)
+        FareRule.objects.filter(vehicle_type='car7').update(is_active=False)
+        options = {o['vehicle_type']: o for o in self.estimate().data['options']}
+        self.assertNotIn('car7', options)
+        self.assertEqual(options['bike']['fare'], 60_000)  # 50.000 + 2.2 km * 4.500 = 59.900
+        r = self.api.post('/api/rides/', {'vehicle_type': 'car7', 'pickup': PICKUP, 'dropoff': DROPOFF},
+                          format='json')
+        self.assertEqual(r.status_code, 400)
 
     @override_settings(GEOAPIFY_API_KEY='')
     def test_without_key_uses_straight_line_then_upgrades(self):
-        r = self.api.post('/api/rides/estimate/', {'pickup': PICKUP, 'dropoff': DROPOFF}, format='json')
-        self.assertEqual(r.data['options'][0]['route']['provider'], 'straight_line')
+        self.assertEqual(self.estimate().data['options'][0]['route']['provider'], 'straight_line')
         with override_settings(GEOAPIFY_API_KEY='k'), \
                 mock.patch('core.routing.requests.get', return_value=geoapify_response()):
-            r = self.api.post('/api/rides/estimate/', {'pickup': PICKUP, 'dropoff': DROPOFF}, format='json')
+            r = self.estimate()
         self.assertEqual(r.data['options'][0]['route']['provider'], 'geoapify')
-        self.assertEqual(Route.objects.count(), 2)
 
-    def test_estimate_validates_coordinates(self):
-        r = self.api.post('/api/rides/estimate/', {'pickup': {'lat': 200, 'lng': 0}, 'dropoff': DROPOFF}, format='json')
-        self.assertEqual(r.status_code, 400)
+    def test_invalid_or_too_short_trip(self):
+        self.assertEqual(self.estimate(pickup={'lat': 200, 'lng': 0}).status_code, 400)
+        near = {'lat': PICKUP['lat'] + 0.0005, 'lng': PICKUP['lng']}  # ~55 m
+        self.assertEqual(self.estimate(dropoff=near).status_code, 400)
+
+    def test_drivers_cannot_estimate(self):
+        r = client_for(make_driver().user).post('/api/rides/estimate/', {'pickup': PICKUP, 'dropoff': DROPOFF},
+                                                format='json')
+        self.assertEqual(r.status_code, 403)
 
 
-@override_settings(GEOAPIFY_API_KEY='test-key')
+@override_settings(GEOAPIFY_API_KEY='test-key', DISPATCH_BATCH_SIZE=3)
 @mock.patch('core.routing.requests.get', return_value=geoapify_response())
 class RideFlowTests(APITestCase):
     def setUp(self):
@@ -111,29 +150,46 @@ class RideFlowTests(APITestCase):
         self.capi = client_for(self.customer)
         self.dapi = client_for(self.driver.user)
 
-    def book(self, vehicle_type='bike'):
-        r = self.capi.post('/api/rides/', {'vehicle_type': vehicle_type, 'pickup': PICKUP, 'dropoff': DROPOFF}, format='json')
+    def book(self, vehicle_type='bike', api=None):
+        r = (api or self.capi).post('/api/rides/', {'vehicle_type': vehicle_type, 'pickup': PICKUP,
+                                                    'dropoff': DROPOFF}, format='json')
         self.assertEqual(r.status_code, 201, r.data)
         return r.data
 
-    def test_full_ride_lifecycle(self, _get):
+    def accept(self, ride, api=None):
+        return (api or self.dapi).post(f"/api/driver/rides/{ride['id']}/accept/")
+
+    def move_driver_to_pickup(self, driver=None):
+        DriverProfile.objects.filter(pk=(driver or self.driver).pk).update(
+            current_latitude=PICKUP['lat'], current_longitude=PICKUP['lng'], location_updated_at=timezone.now()
+        )
+
+    def test_full_ride_lifecycle_with_commission(self, _get):
         ride = self.book()
         self.assertEqual(ride['status'], 'PENDING')
-        self.assertEqual(ride['fare'], estimate_fare('bike', 4200))
-        self.assertEqual(ride['route']['distance_m'], 4200)
+        self.assertIsNotNone(ride['search_expires_at'])
+        self.assertNotIn('driver_earning', ride)  # customers don't see the platform split
+        db_ride = Ride.objects.get(pk=ride['id'])
+        self.assertEqual(db_ride.fare, 22_000)
+        self.assertEqual((db_ride.commission, db_ride.driver_earning), (4_000, 18_000))
 
-        available = self.dapi.get('/api/driver/rides/available/').data
-        self.assertEqual(available['total'], 1)
+        offers = self.dapi.get('/api/driver/offers/').data['offers']
+        self.assertEqual(len(offers), 1)
+        self.assertEqual(offers[0]['ride']['customer']['phone'], '')  # hidden until accepted
+        self.assertEqual(offers[0]['ride']['driver_earning'], 18_000)
 
-        r = self.dapi.post(f"/api/driver/rides/{ride['id']}/accept/")
+        r = self.accept(ride)
         self.assertEqual(r.status_code, 200, r.data)
         self.assertEqual(r.data['status'], 'ACCEPTED')
+        self.assertEqual(r.data['customer']['phone'], '+84912345678')
+        self.assertEqual(r.data['driver_earning'], 18_000)
         self.assertIsNotNone(r.data['approach_route'])
         self.driver.refresh_from_db()
         self.assertEqual(self.driver.status, 'BUSY')
 
         url = f"/api/driver/rides/{ride['id']}/update-status/"
-        self.assertEqual(self.dapi.patch(url, {'status': 'COMPLETED'}, format='json').status_code, 400)  # skip not allowed
+        self.assertEqual(self.dapi.patch(url, {'status': 'COMPLETED'}, format='json').status_code, 400)
+        self.move_driver_to_pickup()
         for s in ('ARRIVED', 'IN_PROGRESS', 'COMPLETED'):
             r = self.dapi.patch(url, {'status': s}, format='json')
             self.assertEqual(r.status_code, 200, r.data)
@@ -142,43 +198,113 @@ class RideFlowTests(APITestCase):
 
         r = self.capi.post(f"/api/rides/{ride['id']}/rate/", {'rating': 4}, format='json')
         self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual(self.capi.post(f"/api/rides/{ride['id']}/rate/", {'rating': 5}, format='json').status_code,
+                         400)
         self.driver.refresh_from_db()
         self.assertEqual(self.driver.rating, 4)
-        self.assertEqual(self.capi.get('/api/rides/current/').data['ride'], None)
-        self.assertEqual(len(self.capi.get('/api/rides/').data), 1)
+        self.assertIsNone(self.capi.get('/api/rides/current/').data['ride'])
 
-    def test_second_driver_cannot_take_accepted_ride(self, _get):
+        history = self.capi.get('/api/rides/?limit=10').data
+        self.assertEqual(history['count'], 1)
+        self.assertEqual(history['results'][0]['id'], ride['id'])
+        earnings = self.dapi.get('/api/driver/earnings/').data
+        self.assertEqual(earnings['today'], {'trips': 1, 'gross': 22_000, 'commission': 4_000, 'net': 18_000})
+        self.assertEqual(len(earnings['recent']), 1)
+
+    def test_customer_cannot_drive_the_ride(self, _get):
+        ride = self.book()
+        self.assertEqual(self.capi.post(f"/api/rides/{ride['id']}/auto-accept/").status_code, 404)
+        self.assertEqual(self.capi.post(f"/api/rides/{ride['id']}/auto-advance/").status_code, 404)
+        self.assertEqual(self.accept(ride, self.capi).status_code, 403)
+
+    def test_arrived_requires_being_near_pickup(self, _get):
+        ride = self.book()
+        self.accept(ride)
+        DriverProfile.objects.filter(pk=self.driver.pk).update(current_latitude=10.80, current_longitude=106.75)
+        url = f"/api/driver/rides/{ride['id']}/update-status/"
+        r = self.dapi.patch(url, {'status': 'ARRIVED'}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.move_driver_to_pickup()
+        self.assertEqual(self.dapi.patch(url, {'status': 'ARRIVED'}, format='json').status_code, 200)
+
+    def test_only_offered_driver_can_accept(self, _get):
+        far = make_driver('+84909999999', lat=10.85, lng=106.80)  # ~12 km, outside radius
+        ride = self.book()
+        self.assertEqual(self.accept(ride, client_for(far.user)).status_code, 400)
+        self.assertEqual(self.accept(ride).status_code, 200)
+
+    def test_first_accept_wins_and_others_are_withdrawn(self, _get):
         other = make_driver('+84909999999')
         ride = self.book()
-        self.assertEqual(self.dapi.post(f"/api/driver/rides/{ride['id']}/accept/").status_code, 200)
-        r = client_for(other.user).post(f"/api/driver/rides/{ride['id']}/accept/")
-        self.assertEqual(r.status_code, 400)
+        self.assertEqual(RideOffer.objects.filter(ride_id=ride['id'], status='PENDING').count(), 2)
+        self.assertEqual(self.accept(ride).status_code, 200)
+        self.assertEqual(self.accept(ride, client_for(other.user)).status_code, 400)
+        self.assertEqual(RideOffer.objects.get(ride_id=ride['id'], driver=other).status, 'WITHDRAWN')
+
+    def test_offers_go_in_batches_to_nearest_free_drivers(self, _get):
+        drivers = [self.driver] + [
+            make_driver(f'+8490900000{i}', lat=10.7735 + 0.003 * i, lng=106.6990) for i in range(1, 4)
+        ]
+        make_driver('+84908888888', vehicle_type='car4')  # wrong type
+        make_driver('+84907777777', seen_ago=600)  # GPS too old
+        make_driver('+84906666666', approved=False)
+        ride = self.book()
+        offered = set(RideOffer.objects.filter(ride_id=ride['id']).values_list('driver_id', flat=True))
+        self.assertEqual(offered, {d.id for d in drivers[:3]})  # three nearest
+
+        # Everyone in the batch declines -> the next nearest gets it.
+        for d in drivers[:3]:
+            self.assertEqual(client_for(d.user).post(f"/api/driver/rides/{ride['id']}/decline/").status_code, 204)
+        last = RideOffer.objects.filter(ride_id=ride['id'], status='PENDING').get()
+        self.assertEqual(last.driver_id, drivers[3].id)
+
+    def test_driver_with_open_offer_gets_no_second_offer(self, _get):
+        self.book()
+        other_customer = make_customer('+84911111111')
+        self.book(api=client_for(other_customer))
+        self.assertEqual(RideOffer.objects.filter(driver=self.driver).count(), 1)
+
+    def test_expired_offer_moves_to_next_driver_on_worker_pass(self, _get):
+        ride = self.book()
+        late = make_driver('+84909999999')  # came online after the first batch
+        RideOffer.objects.filter(ride_id=ride['id']).update(expires_at=timezone.now() - timedelta(seconds=5))
+        self.assertEqual(self.accept(ride).status_code, 400)  # too late
+        services.run_dispatch_cycle()
+        self.assertEqual(RideOffer.objects.get(ride_id=ride['id'], driver=self.driver).status, 'EXPIRED')
+        self.assertEqual(RideOffer.objects.get(ride_id=ride['id'], driver=late).status, 'PENDING')
+
+    def test_search_times_out_with_system_cancel(self, _get):
+        ride = self.book()
+        Ride.objects.filter(pk=ride['id']).update(dispatched_at=timezone.now() - timedelta(minutes=10))
+        self.assertIsNone(self.capi.get('/api/rides/current/').data['ride'])  # lazy, even without the worker
+        r = self.capi.get(f"/api/rides/{ride['id']}/").data
+        self.assertEqual((r['status'], r['cancelled_by']), ('CANCELLED', 'system'))
+        self.assertEqual(RideOffer.objects.get(ride_id=ride['id']).status, 'WITHDRAWN')
 
     def test_only_one_active_ride_per_customer(self, _get):
         self.book()
-        r = self.capi.post('/api/rides/', {'vehicle_type': 'bike', 'pickup': PICKUP, 'dropoff': DROPOFF}, format='json')
+        r = self.capi.post('/api/rides/', {'vehicle_type': 'bike', 'pickup': PICKUP, 'dropoff': DROPOFF},
+                           format='json')
         self.assertEqual(r.status_code, 400)
 
-    def test_wrong_vehicle_type_and_far_drivers_dont_see_ride(self, _get):
-        car = make_driver('+84908888888', vehicle_type='car4')
-        far = make_driver('+84907777777', lat=21.0278, lng=105.8342)  # Hà Nội
-        self.book()
-        self.assertEqual(client_for(car.user).get('/api/driver/rides/available/').data['total'], 0)
-        self.assertEqual(client_for(far.user).get('/api/driver/rides/available/').data['total'], 0)
-
-    def test_driver_cancel_puts_ride_back_to_pending(self, _get):
+    def test_driver_cancel_reoffers_ride_to_someone_else(self, _get):
+        loser = make_driver('+84908888888')  # offered too, but lost the race
         ride = self.book()
-        self.dapi.post(f"/api/driver/rides/{ride['id']}/accept/")
+        self.accept(ride)
+        other = make_driver('+84909999999')
         r = self.dapi.post(f"/api/rides/{ride['id']}/cancel/", {}, format='json')
         self.assertEqual(r.status_code, 200, r.data)
         self.assertEqual(r.data['status'], 'PENDING')
         self.assertIsNone(r.data['driver'])
         self.driver.refresh_from_db()
         self.assertEqual(self.driver.status, 'ONLINE')
+        self.assertTrue(RideOffer.objects.filter(ride_id=ride['id'], driver=other, status='PENDING').exists())
+        self.assertTrue(RideOffer.objects.filter(ride_id=ride['id'], driver=loser, status='PENDING').exists())
+        self.assertFalse(RideOffer.objects.filter(ride_id=ride['id'], driver=self.driver, status='PENDING').exists())
 
     def test_customer_cancel_frees_driver(self, _get):
         ride = self.book()
-        self.dapi.post(f"/api/driver/rides/{ride['id']}/accept/")
+        self.accept(ride)
         r = self.capi.post(f"/api/rides/{ride['id']}/cancel/", {'reason': 'Đổi ý'}, format='json')
         self.assertEqual(r.data['status'], 'CANCELLED')
         self.assertEqual(r.data['cancelled_by'], 'customer')
@@ -187,70 +313,107 @@ class RideFlowTests(APITestCase):
 
     def test_role_permissions(self, _get):
         ride = self.book()
-        self.assertEqual(self.capi.post(f"/api/driver/rides/{ride['id']}/accept/").status_code, 403)
-        r = self.dapi.post('/api/rides/', {'vehicle_type': 'bike', 'pickup': PICKUP, 'dropoff': DROPOFF}, format='json')
+        r = self.dapi.post('/api/rides/', {'vehicle_type': 'bike', 'pickup': PICKUP, 'dropoff': DROPOFF},
+                           format='json')
         self.assertEqual(r.status_code, 403)
         stranger = make_customer('+84911111111')
         self.assertEqual(client_for(stranger).get(f"/api/rides/{ride['id']}/").status_code, 404)
         self.assertEqual(client_for(stranger).post(f"/api/rides/{ride['id']}/cancel/").status_code, 403)
+        # A driver who was only offered the ride can't read its details (customer phone).
+        self.assertEqual(self.dapi.get(f"/api/rides/{ride['id']}/").status_code, 404)
 
-    def test_unapproved_driver_cannot_go_online(self, _get):
-        self.driver.is_approved = False
-        self.driver.status = 'OFFLINE'
-        self.driver.save()
-        r = self.dapi.patch('/api/driver/status/', {'status': 'ONLINE'}, format='json')
-        self.assertEqual(r.status_code, 403)
+    def test_driver_status_rules(self, _get):
+        DriverProfile.objects.filter(pk=self.driver.pk).update(is_approved=False, status='OFFLINE')
+        self.driver.refresh_from_db()
+        self.assertEqual(self.dapi.patch('/api/driver/status/', {'status': 'ONLINE', 'lat': 10.77, 'lng': 106.7},
+                                         format='json').status_code, 403)
+        DriverProfile.objects.filter(pk=self.driver.pk).update(is_approved=True)
+        self.assertEqual(self.dapi.patch('/api/driver/status/', {'status': 'ONLINE'}, format='json').status_code,
+                         400)  # needs GPS
+        r = self.dapi.patch('/api/driver/status/', {'status': 'ONLINE', 'lat': 10.7735, 'lng': 106.699},
+                            format='json')
+        self.assertEqual(r.data['status'], 'ONLINE')
 
-    def test_ride_requested_event_reaches_nearby_driver(self, _get):
+    def test_going_offline_passes_offer_to_next_driver(self, _get):
+        other = make_driver('+84909999999', lat=10.80, lng=106.70)  # farther, so second in line
+        with override_settings(DISPATCH_BATCH_SIZE=1):
+            ride = self.book()
+            self.assertEqual(RideOffer.objects.get(ride_id=ride['id'], status='PENDING').driver_id, self.driver.id)
+            self.dapi.patch('/api/driver/status/', {'status': 'OFFLINE'}, format='json')
+        self.assertEqual(RideOffer.objects.get(ride_id=ride['id'], status='PENDING').driver_id, other.id)
+
+    def test_offer_event_reaches_driver(self, _get):
         layer = get_channel_layer()
         channel = async_to_sync(layer.new_channel)()
         async_to_sync(layer.group_add)(f'user_{self.driver.user_id}', channel)
         with self.captureOnCommitCallbacks(execute=True):
             ride = self.book()
         msg = async_to_sync(layer.receive)(channel)
-        self.assertEqual(msg['event'], 'ride.requested')
-        self.assertEqual(msg['data']['id'], ride['id'])
-        self.assertIn('distance_to_pickup_m', msg['data'])
+        self.assertEqual(msg['event'], 'ride.offer')
+        self.assertEqual(msg['data']['ride_id'], ride['id'])
+        self.assertEqual(msg['data']['ride']['customer']['phone'], '')
+        self.assertIn('expires_at', msg['data'])
+        self.assertTrue(13 <= msg['data']['expires_in'] <= 15)
 
 
-class DriverAuthTests(APITestCase):
-    payload = {
-        'phone': '0901234567', 'full_name': 'Trần Văn Bình', 'password': 'RideSecure!2026',
-        'password_confirm': 'RideSecure!2026', 'license_number': 'B1-123', 'vehicle_plate': '59X2-123.45',
-        'vehicle_type': 'bike',
-    }
-
+class GeoTests(APITestCase):
     def setUp(self):
         cache.clear()
+        self.api = client_for(make_customer())
 
-    def test_register_login_me_refresh(self):
-        r = self.client.post('/api/auth/driver/register/', self.payload, format='json')
-        self.assertEqual(r.status_code, 201, r.data)
-        self.assertEqual(r.data['driver']['phone'], '+84901234567')
-        self.assertTrue(r.data['driver']['is_approved'])
-        r = self.client.post('/api/auth/driver/login/', {'phone': '+84901234567', 'password': 'RideSecure!2026'}, format='json')
-        self.assertEqual(r.status_code, 200, r.data)
-        self.client.credentials(HTTP_AUTHORIZATION='Bearer ' + r.data['access'])
-        self.assertEqual(self.client.get('/api/auth/driver/me/').status_code, 200)
-        self.assertEqual(self.client.get('/api/auth/me/').status_code, 403)  # not a customer
-        self.client.credentials()
-        self.assertEqual(self.client.post('/api/auth/refresh/', {'refresh': r.data['refresh']}, format='json').status_code, 200)
+    @override_settings(GEOAPIFY_API_KEY='k')
+    @mock.patch('core.geocoding.requests.get')
+    def test_search_and_reverse(self, get):
+        get.return_value = mock.Mock(raise_for_status=lambda: None, json=lambda: {'results': [
+            {'name': 'Chợ Bến Thành', 'address_line2': 'Lê Lợi, Quận 1', 'formatted': 'x', 'lat': 10.77, 'lon': 106.69},
+        ]})
+        r = self.api.get('/api/geo/search/', {'q': 'ben thanh', 'lat': 10.77, 'lng': 106.7})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.data['results'][0], {'name': 'Chợ Bến Thành', 'address': 'Lê Lợi, Quận 1',
+                                                'lat': 10.77, 'lng': 106.69})
+        self.assertNotIn('k', str(r.data))
+        self.api.get('/api/geo/search/', {'q': 'ben thanh', 'lat': 10.77, 'lng': 106.7})
+        self.assertEqual(get.call_count, 1)  # cached
+        r = self.api.get('/api/geo/reverse/', {'lat': 10.7725, 'lng': 106.6981})
+        self.assertEqual((r.data['name'], r.data['lat']), ('Chợ Bến Thành', 10.7725))
 
+    @override_settings(GEOAPIFY_API_KEY='')
+    def test_without_key(self):
+        self.assertEqual(self.api.get('/api/geo/search/', {'q': 'abc'}).data['results'], [])
+        self.assertEqual(self.api.get('/api/geo/reverse/', {'lat': 10.77, 'lng': 106.69}).data['name'],
+                         '10.77000, 106.69000')
+        self.assertEqual(self.api.get('/api/geo/search/', {'q': 'a'}).status_code, 400)
+
+    def test_requires_login_and_health_is_public(self):
+        self.assertEqual(APIClient().get('/api/geo/search/', {'q': 'abc'}).status_code, 401)
+        self.assertEqual(APIClient().get('/api/health/').data, {'status': 'ok'})
+
+
+class SamePhoneTests(APITestCase):
     def test_same_phone_can_be_customer_and_driver(self):
+        cache.clear()
         make_customer('+84901234567')
-        r = self.client.post('/api/auth/driver/register/', self.payload, format='json')
+        _, code = request_otp(self.client, '0901234567', role='driver')
+        cache.clear()
+        r = self.client.post('/api/auth/driver/register/', {
+            'phone': '0901234567', 'full_name': 'Trần Văn Bình', 'password': 'RideSecure!2026',
+            'password_confirm': 'RideSecure!2026', 'license_number': 'B1-123', 'vehicle_plate': '59X2-123.45',
+            'vehicle_type': 'bike', 'otp': code,
+        }, format='json')
         self.assertEqual(r.status_code, 201, r.data)
-        r = self.client.post('/api/auth/login/', {'phone': '0901234567', 'password': 'RideSecure!2026'}, format='json')
+        r = self.client.post('/api/auth/login/', {'phone': '0901234567', 'password': 'RideSecure!2026'},
+                             format='json')
         self.assertEqual(r.status_code, 400)  # driver password doesn't log into the customer account
 
 
+@override_settings(RIDE_WORKER_EMBEDDED=False)
 class WebSocketTests(TransactionTestCase):
-    def test_rejects_missing_token(self):
+    def test_rejects_missing_token_with_4401(self):
         async def run():
             comm = WebsocketCommunicator(application, '/ws/')
-            connected, code = await comm.connect()
-            self.assertFalse(connected)
-            self.assertEqual(code, 4401)
+            await comm.connect()
+            output = await comm.receive_output()
+            self.assertEqual(output, {'type': 'websocket.close', 'code': 4401})
         async_to_sync(run)()
 
     @override_settings(GEOAPIFY_API_KEY='')
@@ -274,10 +437,10 @@ class WebSocketTests(TransactionTestCase):
             self.assertEqual((await d.receive_json_from())['event'], 'connected')
             await d.send_json_to({'type': 'ping'})
             self.assertEqual((await d.receive_json_from())['event'], 'pong')
-            await d.send_json_to({'type': 'driver.location', 'lat': 10.776, 'lng': 106.70})
+            await d.send_json_to({'type': 'driver.location', 'lat': 10.776, 'lng': 106.70, 'heading': 90})
             msg = await c.receive_json_from(timeout=3)
             self.assertEqual(msg['event'], 'driver.location')
-            self.assertEqual(msg['data'], {'ride_id': str(ride.id), 'lat': 10.776, 'lng': 106.70})
+            self.assertEqual(msg['data'], {'ride_id': str(ride.id), 'lat': 10.776, 'lng': 106.70, 'heading': 90.0})
             # Customers can't push locations
             await c.send_json_to({'type': 'driver.location', 'lat': 1, 'lng': 1})
             self.assertEqual((await c.receive_json_from())['event'], 'error')
@@ -286,4 +449,12 @@ class WebSocketTests(TransactionTestCase):
 
         async_to_sync(run)()
         driver.refresh_from_db()
-        self.assertEqual(driver.current_latitude, 10.776)
+        self.assertEqual((driver.current_latitude, driver.current_heading), (10.776, 90.0))
+
+    def test_unknown_heading_is_stored_as_null(self):
+        driver = make_driver()
+        r = client_for(driver.user).post('/api/driver/location/', {'lat': 10.77, 'lng': 106.7, 'heading': -1},
+                                         format='json')
+        self.assertEqual(r.status_code, 204)
+        driver.refresh_from_db()
+        self.assertIsNone(driver.current_heading)

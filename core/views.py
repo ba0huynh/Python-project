@@ -1,14 +1,16 @@
+from django.db import connection
 from django.db.models import Q
 from rest_framework import permissions, status
+from rest_framework.pagination import LimitOffsetPagination
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from . import services
-from .models import DriverProfile, Ride
+from . import geocoding, services
+from .models import Ride
 from .serializers import (
     CancelSerializer, CreateRideSerializer, DriverProfileSerializer, DriverStatusSerializer,
-    EstimateOptionSerializer, EstimateRequestSerializer, LocationSerializer, RateSerializer,
-    RideSerializer, RideStatusSerializer,
+    EstimateOptionSerializer, EstimateRequestSerializer, GeoPointSerializer, GeoSearchSerializer,
+    LocationSerializer, OfferSerializer, RateSerializer, RideSerializer, RideStatusSerializer,
 )
 
 RIDE_RELATED = ('customer__customer', 'driver', 'route', 'approach_route')
@@ -28,40 +30,71 @@ class IsDriver(permissions.BasePermission):
         return services.get_driver(request.user) is not None
 
 
-def validated(serializer_class, request):
-    s = serializer_class(data=request.data)
+def validated(serializer_class, data):
+    s = serializer_class(data=data)
     s.is_valid(raise_exception=True)
     return s.validated_data
+
+
+def ride_response(request, ride, code=status.HTTP_200_OK):
+    return Response(services.ride_payload(ride, services.viewer_for(request.user, ride)), status=code)
+
+
+def my_rides(user):
+    driver = services.get_driver(user)
+    return Ride.objects.filter(Q(driver=driver) if driver else Q(customer=user))
+
+
+class HealthView(APIView):
+    """GET /api/health/ for load balancers / uptime checks."""
+    permission_classes = [permissions.AllowAny]
+    authentication_classes = []
+
+    def get(self, request):
+        connection.ensure_connection()
+        return Response({'status': 'ok'})
 
 
 # --- Customer -----------------------------------------------------------------
 
 class RideEstimateView(APIView):
     """POST /api/rides/estimate/ -> road route + fare for each vehicle type."""
+    permission_classes = [permissions.IsAuthenticated, IsCustomer]
+    throttle_scope = 'estimate'
 
     def post(self, request):
-        data = validated(EstimateRequestSerializer, request)
+        data = validated(EstimateRequestSerializer, request.data)
         options = services.estimate(data['pickup'], data['dropoff'])
         return Response({'options': EstimateOptionSerializer(options, many=True).data})
 
 
+class RidePagination(LimitOffsetPagination):
+    default_limit = 20
+    max_limit = 100
+
+
 class RideListCreateView(APIView):
-    """GET: my rides (customer or driver). POST (customer): book a ride."""
+    """GET: my rides, newest first (customer: booked, driver: driven). POST (customer): book a ride."""
+
+    def get_throttles(self):
+        self.throttle_scope = 'booking' if self.request.method == 'POST' else None
+        return super().get_throttles()
 
     def get(self, request):
-        driver = services.get_driver(request.user)
-        q = Q(customer=request.user)
-        if driver:
-            q |= Q(driver=driver)
-        rides = Ride.objects.filter(q).select_related(*RIDE_RELATED)[:50]
-        return Response(RideSerializer(rides, many=True).data)
+        paginator = RidePagination()
+        rides = my_rides(request.user).select_related(*RIDE_RELATED).order_by('-created_at')
+        page = paginator.paginate_queryset(rides, request, view=self)
+        viewer = 'driver' if services.get_driver(request.user) else 'customer'
+        return paginator.get_paginated_response(
+            [services.ride_payload(r, viewer) for r in page]
+        )
 
     def post(self, request):
         if not services.is_customer(request.user):
             return Response({'detail': IsCustomer.message}, status=status.HTTP_403_FORBIDDEN)
-        data = validated(CreateRideSerializer, request)
+        data = validated(CreateRideSerializer, request.data)
         ride = services.create_ride(request.user, data['vehicle_type'], data['pickup'], data['dropoff'])
-        return Response(RideSerializer(ride).data, status=status.HTTP_201_CREATED)
+        return ride_response(request, ride, status.HTTP_201_CREATED)
 
 
 class CurrentRideView(APIView):
@@ -69,40 +102,42 @@ class CurrentRideView(APIView):
 
     def get(self, request):
         driver = services.get_driver(request.user)
-        q = Q(customer=request.user, status__in=Ride.ACTIVE_STATUSES)
         if driver:
-            q |= Q(driver=driver, status__in=services.DRIVER_ACTIVE_STATUSES)
-        ride = Ride.objects.filter(q).select_related(*RIDE_RELATED).first()
-        return Response({'ride': RideSerializer(ride).data if ride else None})
+            qs = Ride.objects.filter(driver=driver, status__in=services.DRIVER_ACTIVE_STATUSES)
+        else:
+            qs = Ride.objects.filter(customer=request.user, status__in=Ride.ACTIVE_STATUSES)
+        ride = qs.first()
+        # Without the worker running, a search must still end for the customer.
+        if ride and ride.status == 'PENDING' and services.expire_ride_if_stale(ride.id):
+            ride = None
+        if ride is None:
+            return Response({'ride': None})
+        ride = Ride.objects.select_related(*RIDE_RELATED).get(pk=ride.pk)
+        return Response({'ride': services.ride_payload(ride, services.viewer_for(request.user, ride))})
 
 
 class RideDetailView(APIView):
     def get(self, request, ride_id):
-        driver = services.get_driver(request.user)
-        q = Q(customer=request.user)
-        if driver:
-            # Drivers may also look at pending rides they are being offered.
-            q |= Q(driver=driver) | Q(status='PENDING', vehicle_type=driver.vehicle_type)
-        ride = Ride.objects.filter(q, pk=ride_id).select_related(*RIDE_RELATED).first()
+        ride = my_rides(request.user).select_related(*RIDE_RELATED).filter(pk=ride_id).first()
         if ride is None:
             return Response({'detail': 'Không tìm thấy chuyến đi.'}, status=status.HTTP_404_NOT_FOUND)
-        return Response(RideSerializer(ride).data)
+        return ride_response(request, ride)
 
 
 class CancelRideView(APIView):
     def post(self, request, ride_id):
-        data = validated(CancelSerializer, request)
+        data = validated(CancelSerializer, request.data)
         ride = services.cancel_ride(request.user, ride_id, data['reason'])
-        return Response(RideSerializer(ride).data)
+        return ride_response(request, ride)
 
 
 class RateRideView(APIView):
     permission_classes = [permissions.IsAuthenticated, IsCustomer]
 
     def post(self, request, ride_id):
-        data = validated(RateSerializer, request)
+        data = validated(RateSerializer, request.data)
         ride = services.rate_ride(request.user, ride_id, data['rating'], data['comment'])
-        return Response(RideSerializer(ride).data)
+        return ride_response(request, ride)
 
 
 # --- Driver -------------------------------------------------------------------
@@ -116,10 +151,10 @@ class DriverOnlyView(APIView):
 
 
 class UpdateDriverStatusView(DriverOnlyView):
-    """PATCH /api/driver/status/ {status: ONLINE|OFFLINE, lat?, lng?}"""
+    """PATCH /api/driver/status/ {status: ONLINE|OFFLINE, lat, lng}"""
 
     def patch(self, request):
-        data = validated(DriverStatusSerializer, request)
+        data = validated(DriverStatusSerializer, request.data)
         driver = services.set_driver_status(
             self.driver, data['status'] == 'ONLINE', data.get('lat'), data.get('lng')
         )
@@ -127,67 +162,67 @@ class UpdateDriverStatusView(DriverOnlyView):
 
 
 class DriverLocationView(DriverOnlyView):
-    """POST /api/driver/location/ {lat, lng}. The WebSocket does the same, prefer it."""
+    """POST /api/driver/location/ {lat, lng, heading?}. Fallback for the WebSocket message."""
+    throttle_scope = 'location'
 
     def post(self, request):
-        data = validated(LocationSerializer, request)
-        services.update_driver_location(self.driver, data['lat'], data['lng'])
+        data = validated(LocationSerializer, request.data)
+        services.update_driver_location(self.driver, data['lat'], data['lng'], data['heading'])
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-class AvailableRidesView(DriverOnlyView):
-    """GET /api/driver/rides/available/ -> pending rides near me, closest first."""
+class DriverOffersView(DriverOnlyView):
+    """GET /api/driver/offers/ -> my open ride offer(s), e.g. after reconnecting."""
 
     def get(self, request):
-        rides = services.available_rides_for(self.driver)
-        data = [{**RideSerializer(r).data, 'distance_to_pickup_m': int(d)} for d, r in rides]
-        return Response({'total': len(data), 'rides': data})
+        return Response({'offers': OfferSerializer(services.open_offers_for(self.driver), many=True).data})
 
 
 class AcceptRideView(DriverOnlyView):
     def post(self, request, ride_id):
         ride = services.accept_ride(self.driver, ride_id)
-        return Response(RideSerializer(ride).data)
+        return ride_response(request, ride)
+
+
+class DeclineRideView(DriverOnlyView):
+    def post(self, request, ride_id):
+        services.decline_ride(self.driver, ride_id)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class UpdateRideStatusView(DriverOnlyView):
     """PATCH /api/driver/rides/<id>/update-status/ {status: ARRIVED|IN_PROGRESS|COMPLETED}"""
 
     def patch(self, request, ride_id):
-        data = validated(RideStatusSerializer, request)
+        data = validated(RideStatusSerializer, request.data)
         ride = services.advance_ride(self.driver, ride_id, data['status'])
-        return Response(RideSerializer(ride).data)
+        return ride_response(request, ride)
 
 
-class AutoAcceptRideView(APIView):
-    """Assign the nearest available online driver to this pending ride."""
-    permission_classes = [permissions.IsAuthenticated]
+class DriverEarningsView(DriverOnlyView):
+    """GET /api/driver/earnings/ -> today / week / month totals + recent completed rides."""
 
-    def post(self, request, ride_id):
-        ride = Ride.objects.filter(pk=ride_id, status='PENDING').first()
-        if not ride:
-            return Response({'detail': 'Không tìm thấy chuyến xe đang chờ.'}, status=status.HTTP_404_NOT_FOUND)
-        drivers = services.nearby_drivers(ride.pickup_lat, ride.pickup_lng, ride.vehicle_type)
-        if not drivers:
-            driver = DriverProfile.objects.filter(status='ONLINE', vehicle_type=ride.vehicle_type, is_approved=True).first()
-            if not driver:
-                return Response({'detail': 'Không có tài xế nào trực tuyến gần đây.'}, status=status.HTTP_400_BAD_REQUEST)
-        else:
-            driver = drivers[0][1]
-        accepted_ride = services.accept_ride(driver, ride.id)
-        return Response(RideSerializer(accepted_ride).data)
+    def get(self, request):
+        data = services.driver_earnings(self.driver)
+        data['recent'] = [services.ride_payload(r, 'driver') for r in data['recent']]
+        return Response(data)
 
 
-class AutoAdvanceRideView(APIView):
-    """Advance ride status (ARRIVED, IN_PROGRESS, COMPLETED) using its assigned driver."""
-    permission_classes = [permissions.IsAuthenticated]
+# --- Places -------------------------------------------------------------------
 
-    def post(self, request, ride_id):
-        ride = Ride.objects.filter(pk=ride_id).first()
-        if not ride or not ride.driver:
-            return Response({'detail': 'Chuyến đi chưa có tài xế.'}, status=status.HTTP_400_BAD_REQUEST)
-        next_status = services.DRIVER_TRANSITIONS.get(ride.status)
-        if not next_status:
-            return Response({'detail': f'Không thể chuyển tiếp từ {ride.status}.'}, status=status.HTTP_400_BAD_REQUEST)
-        advanced_ride = services.advance_ride(ride.driver, ride.id, next_status[0])
-        return Response(RideSerializer(advanced_ride).data)
+class GeoSearchView(APIView):
+    """GET /api/geo/search/?q=&lat=&lng= -> {results: [{name, address, lat, lng}]}"""
+    throttle_scope = 'geo'
+
+    def get(self, request):
+        data = validated(GeoSearchSerializer, request.query_params)
+        return Response({'results': geocoding.search(data['q'], data.get('lat'), data.get('lng'))})
+
+
+class GeoReverseView(APIView):
+    """GET /api/geo/reverse/?lat=&lng= -> {name, address, lat, lng}"""
+    throttle_scope = 'geo'
+
+    def get(self, request):
+        data = validated(GeoPointSerializer, request.query_params)
+        return Response(geocoding.reverse(data['lat'], data['lng']))

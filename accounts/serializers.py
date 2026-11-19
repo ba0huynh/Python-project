@@ -6,12 +6,14 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenRefreshSerializer
+from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from django.conf import settings
 
 from core.models import DriverProfile, VehicleType
 
+from . import otp as otp_service
 from .models import Customer
 
 User = get_user_model()
@@ -24,6 +26,33 @@ def normalize_phone(value):
     if not re.fullmatch(r'\+84[35789]\d{8}', value):
         raise serializers.ValidationError('Số điện thoại di động Việt Nam không hợp lệ.')
     return value
+
+
+OTP_ERROR = 'Mã OTP không đúng hoặc đã hết hạn.'
+
+
+def check_otp(phone, purpose, role, code):
+    if not otp_service.verify(phone, purpose, role, code):
+        raise serializers.ValidationError({'otp': OTP_ERROR})
+
+
+def is_registered(phone, role):
+    if role == 'driver':
+        return DriverProfile.objects.filter(phone=phone).exists()
+    return Customer.objects.filter(phone=phone).exists()
+
+
+class OTPRequestSerializer(serializers.Serializer):
+    phone = serializers.CharField(max_length=20)
+    purpose = serializers.ChoiceField(choices=['register', 'reset_password'])
+    role = serializers.ChoiceField(choices=['customer', 'driver'], default='customer')
+
+    validate_phone = staticmethod(normalize_phone)
+
+    def validate(self, data):
+        if data['purpose'] == 'register' and is_registered(data['phone'], data['role']):
+            raise serializers.ValidationError({'phone': 'Số điện thoại đã được đăng ký.'})
+        return data
 
 
 class CustomerSerializer(serializers.ModelSerializer):
@@ -40,6 +69,7 @@ class RegisterSerializer(serializers.Serializer):
     email = serializers.EmailField(required=False, allow_blank=True, default='')
     password = serializers.CharField(write_only=True, trim_whitespace=False, max_length=128)
     password_confirm = serializers.CharField(write_only=True, trim_whitespace=False, max_length=128)
+    otp = serializers.CharField(max_length=10, write_only=True)
 
     validate_phone = staticmethod(normalize_phone)
 
@@ -51,6 +81,9 @@ class RegisterSerializer(serializers.Serializer):
             validate_password(data['password'], user=user)
         except DjangoValidationError as exc:
             raise serializers.ValidationError({'password': exc.messages})
+        if is_registered(data['phone'], 'customer'):
+            raise serializers.ValidationError({'phone': 'Số điện thoại đã được đăng ký.'})
+        check_otp(data['phone'], 'register', 'customer', data['otp'])  # last: it consumes the code
         return data
 
     def create(self, data):
@@ -117,8 +150,18 @@ class DriverRegisterSerializer(serializers.Serializer):
     vehicle_plate = serializers.CharField(max_length=20)
     vehicle_type = serializers.ChoiceField(choices=VehicleType.choices, default=VehicleType.BIKE)
     vehicle_name = serializers.CharField(max_length=100, required=False, allow_blank=True, default='')
+    otp = serializers.CharField(max_length=10, write_only=True)
 
     validate_phone = staticmethod(normalize_phone)
+
+    def validate_license_number(self, value):
+        value = value.strip().upper()
+        if DriverProfile.objects.filter(license_number=value).exists():
+            raise serializers.ValidationError('Số bằng lái đã được đăng ký.')
+        return value
+
+    def validate_vehicle_plate(self, value):
+        return value.strip().upper()
 
     def validate(self, data):
         if data['password'] != data['password_confirm']:
@@ -128,6 +171,9 @@ class DriverRegisterSerializer(serializers.Serializer):
             validate_password(data['password'], user=user)
         except DjangoValidationError as exc:
             raise serializers.ValidationError({'password': exc.messages})
+        if is_registered(data['phone'], 'driver'):
+            raise serializers.ValidationError({'phone': 'Số điện thoại đã được đăng ký.'})
+        check_otp(data['phone'], 'register', 'driver', data['otp'])  # last: it consumes the code
         return data
 
     def create(self, data):
@@ -178,41 +224,34 @@ class LogoutSerializer(serializers.Serializer):
 class ResetPasswordSerializer(serializers.Serializer):
     phone = serializers.CharField(max_length=20)
     role = serializers.ChoiceField(choices=['customer', 'driver'], default='customer')
-    otp = serializers.CharField(max_length=10, default='1234', required=False)
+    otp = serializers.CharField(max_length=10)
     new_password = serializers.CharField(write_only=True, trim_whitespace=False, max_length=128)
     new_password_confirm = serializers.CharField(write_only=True, trim_whitespace=False, max_length=128)
 
     validate_phone = staticmethod(normalize_phone)
 
     def validate(self, data):
-        otp = data.get('otp', '1234')
-        if not otp:
-            otp = '1234'
-        if otp.strip() != '1234':
-            raise serializers.ValidationError({'otp': 'Mã OTP không đúng. Mã mặc định là 1234.'})
-
         if data['new_password'] != data['new_password_confirm']:
             raise serializers.ValidationError({'new_password_confirm': 'Mật khẩu xác nhận không khớp.'})
-
-        role = data.get('role', 'customer')
-        username = driver_username(data['phone']) if role == 'driver' else data['phone']
-
-        try:
-            user = User.objects.get(username=username)
-        except User.DoesNotExist:
-            role_label = 'tài xế' if role == 'driver' else 'khách hàng'
-            raise serializers.ValidationError({'phone': f'Số điện thoại này chưa được đăng ký làm {role_label}.'})
-
+        username = driver_username(data['phone']) if data['role'] == 'driver' else data['phone']
+        user = User.objects.filter(username=username, is_active=True).first()
         try:
             validate_password(data['new_password'], user=user)
         except DjangoValidationError as exc:
             raise serializers.ValidationError({'new_password': exc.messages})
-
+        # No code is ever sent to an unknown phone, so this also covers "not registered"
+        # without telling an attacker which numbers have accounts.
+        check_otp(data['phone'], 'reset_password', data['role'], data['otp'])
+        if user is None:
+            raise serializers.ValidationError({'otp': OTP_ERROR})
         data['user'] = user
         return data
 
     def save(self):
         user = self.validated_data['user']
         user.set_password(self.validated_data['new_password'])
-        user.save()
+        user.save(update_fields=['password'])
+        # Sign out every device that used the old password.
+        for token in OutstandingToken.objects.filter(user=user):
+            BlacklistedToken.objects.get_or_create(token=token)
         return user

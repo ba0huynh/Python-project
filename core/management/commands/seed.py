@@ -1,5 +1,6 @@
 from django.contrib.auth import get_user_model
-from django.core.management.base import BaseCommand
+from django.conf import settings
+from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 from django.utils import timezone
 
@@ -29,13 +30,16 @@ DRIVERS = [
 
 
 class Command(BaseCommand):
-    help = 'Seed demo customers and online drivers (password for all: GoXe!2026)'
+    help = 'Seed test customers and online drivers for LOCAL DEVELOPMENT (password for all: GoXe!2026)'
 
     def add_arguments(self, parser):
         parser.add_argument('--clear', action='store_true', help='Delete seeded accounts and their rides first')
+        parser.add_argument('--force', action='store_true', help='Allow running with DEBUG off (never in production)')
 
     @transaction.atomic
     def handle(self, *args, **options):
+        if not settings.DEBUG and not options['force']:
+            raise CommandError('Refusing to create test accounts with a known password while DEBUG is off.')
         usernames = [c['phone'] for c in CUSTOMERS] + [f"driver:{d['phone']}" for d in DRIVERS]
         if options['clear']:
             Ride.objects.filter(customer__username__in=usernames).delete()

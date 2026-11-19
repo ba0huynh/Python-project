@@ -1,136 +1,122 @@
-# API chuyến đi, tài xế, bản đồ đường đi và WebSocket
+# GoXe API: chuyến đi, tài xế, địa điểm, realtime
 
-Base URL local: `http://<máy>:8000/api/`. Mọi request (trừ đăng ký/đăng nhập) gửi
-`Authorization: Bearer <access token>` và `Content-Type: application/json`.
-Toạ độ trong body luôn là `{"lat": ..., "lng": ...}`. Riêng `geometry` của route là
-GeoJSON nên toạ độ là **`[lng, lat]`**, vẽ thẳng bằng MapLibre.
+Tất cả endpoint dưới `/api/`, JSON, xác thực `Authorization: Bearer <access>` (trừ `/api/health/`).
+Lỗi theo kiểu DRF: `{"detail": "..."}` hoặc `{"field": ["..."]}`. Toạ độ trong body là `{lat, lng}`;
+hình học GeoJSON là `[lng, lat]`. Tiền là số nguyên VND, làm tròn 1.000đ.
 
-## Chạy
+Tài khoản và OTP: xem [customer-auth.md](customer-auth.md).
 
-```powershell
-docker compose up -d                       # Postgres (cổng lấy từ POSTGRES_PORT trong .env)
-.\.venv\Scripts\python.exe manage.py migrate
-.\.venv\Scripts\python.exe manage.py seed  # tài khoản mẫu, mật khẩu GoXe!2026
-.\.venv\Scripts\python.exe manage.py runserver 0.0.0.0:8000   # HTTP + WebSocket (daphne)
+## Giá cước (theo km) và phí nền tảng
+
+Bảng giá nằm trong bảng `FareRule` (sửa ở `/admin` → *Fare rules*, không cần deploy):
+
+```
+cước = base_fare + per_km × max(0, km − base_km), tối thiểu minimum_fare, làm tròn 1.000đ
+phí nền tảng (commission) = cước × commission_percent %, làm tròn 1.000đ
+tài xế nhận (driver_earning) = cước − commission
 ```
 
-Tài khoản mẫu sau khi `seed`:
+| Loại | base_fare (2 km đầu) | per_km | tối thiểu | phí nền tảng |
+|---|---|---|---|---|
+| `bike` GoBike | 12.000 | 4.500 | 12.000 | 20% |
+| `car4` GoCar 4 chỗ | 25.000 | 9.000 | 25.000 | 20% |
+| `car7` GoCar 7 chỗ | 30.000 | 11.000 | 30.000 | 20% |
 
-| Vai trò | SĐT | Xe |
-|---|---|---|
-| Khách | 0912345678, 0987654321 | |
-| Tài xế | 0901234567, 0902345678 | bike |
-| Tài xế | 0903456789 | car4 |
-| Tài xế | 0904567890 | car7 |
+Giá **chốt lúc đặt** (upfront): số tiền trong `estimate` là số khách trả. Thanh toán tiền mặt:
+tài xế thu `fare` từ khách; nền tảng thu `commission` từ tài xế. Quãng đường lấy từ Geoapify
+(đường thật); không có key thì dùng đường chim bay × 1,3.
 
-Tài xế mẫu đang `ONLINE` quanh chợ Bến Thành (Quận 1).
+## Ghép tài xế (dispatch)
 
-## Geoapify (vẽ đường đi)
+1. Đặt xe → chuyến `PENDING`, gửi **lời mời** (`RideOffer`) tới `DISPATCH_BATCH_SIZE` (3) tài xế
+   gần nhất thỏa: `ONLINE`, đã duyệt, đúng loại xe, trong `DRIVER_SEARCH_RADIUS_KM` (5 km),
+   GPS mới trong `DRIVER_LOCATION_MAX_AGE_SECONDS` (120 s), không đang giữ lời mời khác.
+2. Mỗi lời mời sống `DRIVER_OFFER_SECONDS` (15 s). Ai nhận trước thì được; người còn lại nhận
+   `ride.offer_cancelled` (`taken`).
+3. Khi mọi lời mời đã bị từ chối / hết hạn, đợt tiếp theo được gửi (kể cả tài xế mới bật app).
+   Tài xế đã từ chối, để hết hạn hoặc đã hủy không được mời lại chuyến đó.
+4. Không ai nhận trong `RIDE_SEARCH_SECONDS` (180 s) → chuyến `CANCELLED`, `cancelled_by="system"`,
+   `cancel_reason="Không tìm thấy tài xế phù hợp."`.
+5. Bước 3–4 do **dispatcher** chạy mỗi 2 s: tự chạy trong web server khi không có Redis
+   (`RIDE_WORKER_EMBEDDED`), hoặc tiến trình riêng `python manage.py ride_worker` khi có Redis.
 
-Đặt `GEOAPIFY_API_KEY` trong `.env` (miễn phí tại https://myprojects.geoapify.com).
-Server gọi Geoapify Routing (`mode=motorcycle` cho xe máy, `drive` cho ô tô), gộp các
-leg thành một `LineString` và lưu vào bảng `core_route`. Hai điểm làm tròn 4 chữ số thập
-phân (~11 m), nên cùng một tuyến chỉ gọi API một lần.
+Trạng thái: `PENDING → ACCEPTED → ARRIVED → IN_PROGRESS → COMPLETED`; khách hủy được khi
+`PENDING/ACCEPTED/ARRIVED`; tài xế hủy khi `ACCEPTED/ARRIVED` → chuyến quay lại `PENDING` và được
+mời tài xế khác. "Đã đến" chỉ hợp lệ khi tài xế cách điểm đón ≤ `DRIVER_ARRIVAL_RADIUS_M` (300 m).
 
-Không có key hoặc Geoapify lỗi: server lưu đường thẳng ước lượng (`provider:
-"straight_line"`, quãng đường x1.3, 25 km/h). Khi có key, lần gọi sau tự thay bằng đường thật.
+## Đối tượng
 
-Route object:
-
+**Ride**
 ```json
-{"id": "<uuid>", "mode": "motorcycle", "distance_m": 4690, "duration_s": 780,
- "provider": "geoapify", "geometry": {"type": "LineString", "coordinates": [[106.6981, 10.7725], ...]}}
+{
+  "id": "uuid", "status": "PENDING", "vehicle_type": "bike",
+  "pickup": {"address": "Chợ Bến Thành", "lat": 10.7725, "lng": 106.6981},
+  "dropoff": {"address": "Landmark 81", "lat": 10.795, "lng": 106.7219},
+  "distance_m": 4200, "duration_s": 780, "fare": 22000, "payment_method": "cash",
+  "customer": {"id": "uuid", "full_name": "…", "phone": "+849…"},
+  "driver": {"id": "uuid", "full_name": "…", "phone": "+849…", "vehicle_type": "bike",
+             "vehicle_name": "Honda Vision · Đỏ", "vehicle_plate": "59X2-123.45", "rating": 4.9,
+             "lat": 10.77, "lng": 106.70, "heading": 90.0},
+  "route": {"id": "uuid", "mode": "motorcycle", "distance_m": 4200, "duration_s": 780,
+            "geometry": {"type": "LineString", "coordinates": [[106.6981, 10.7725], "…"]},
+            "provider": "geoapify"},
+  "approach_route": null,
+  "created_at": "…", "accepted_at": null, "arrived_at": null, "started_at": null,
+  "completed_at": null, "cancelled_at": null, "cancelled_by": "", "cancel_reason": "",
+  "rating": null, "rating_comment": "", "search_expires_at": "…",
+  "driver_earning": 18000, "commission": 4000
+}
 ```
+- `driver_earning`, `commission`: chỉ có khi người xem là tài xế của chuyến (hoặc trong lời mời).
+- `approach_route`: vị trí tài xế lúc nhận → điểm đón.
+- `search_expires_at`: hạn tìm tài xế khi `PENDING`, ngược lại `null`.
 
-## Tài khoản tài xế (`/api/auth/driver/`)
+**Offer** (lời mời cho tài xế): `{offer_id, ride_id, expires_at, expires_in, distance_to_pickup_m, ride}`.
+`expires_in` là số giây còn lại (dùng cho đồng hồ đếm ngược, không phụ thuộc giờ điện thoại).
+`ride.customer.phone` để trống cho tới khi tài xế nhận chuyến.
 
-| Method | Đường dẫn | Body | Kết quả |
+## Endpoint
+
+| Method | Đường dẫn | Ai | Mô tả |
 |---|---|---|---|
-| POST | `register/` | `phone, full_name, password, password_confirm, license_number, vehicle_plate, vehicle_type (bike/car4/car7), vehicle_name?` | 201 `{driver, access, refresh}` |
-| POST | `login/` | `phone, password` | 200 `{driver, access, refresh}` |
-| GET | `me/` | | hồ sơ tài xế |
+| GET | `health/` | công khai | `{"status": "ok"}` (kiểm tra DB) |
+| POST | `rides/estimate/` | khách | `{pickup, dropoff}` → `{options: [{vehicle_type, name, seats, fare, distance_m, duration_s, route, drivers_nearby}]}` |
+| POST | `rides/` | khách | `{vehicle_type, pickup{lat,lng,address}, dropoff{…}}` → 201 Ride. 400 nếu đang có chuyến |
+| GET | `rides/?limit=20&offset=0` | cả hai | `{count, next, previous, results: Ride[]}` (khách: chuyến đã đặt; tài xế: chuyến đã chạy) |
+| GET | `rides/current/` | cả hai | `{ride: Ride \| null}` chuyến đang diễn ra |
+| GET | `rides/<id>/` | cả hai | chi tiết chuyến của mình |
+| POST | `rides/<id>/cancel/` | cả hai | `{reason?}` → Ride |
+| POST | `rides/<id>/rate/` | khách | `{rating: 1-5, comment?}` → Ride (một lần) |
+| PATCH | `driver/status/` | tài xế | `{status: ONLINE\|OFFLINE, lat, lng}` (bật cần GPS; chưa duyệt → 403) |
+| POST | `driver/location/` | tài xế | `{lat, lng, heading?}` → 204 (dự phòng khi mất WebSocket) |
+| GET | `driver/offers/` | tài xế | `{offers: Offer[]}` lời mời đang mở (0 hoặc 1) |
+| POST | `driver/rides/<id>/accept/` | tài xế | → Ride. 400 nếu lời mời hết hạn / đã có người nhận |
+| POST | `driver/rides/<id>/decline/` | tài xế | → 204, chuyển lời mời cho tài xế kế tiếp |
+| PATCH | `driver/rides/<id>/update-status/` | tài xế | `{status: ARRIVED\|IN_PROGRESS\|COMPLETED}` → Ride |
+| GET | `driver/earnings/` | tài xế | `{today, week, month: {trips, gross, commission, net}, recent: Ride[]}` (giờ Việt Nam) |
+| GET | `geo/search/?q=&lat=&lng=` | đăng nhập | `{results: [{name, address, lat, lng}]}` (q ≥ 2 ký tự, ưu tiên gần lat/lng) |
+| GET | `geo/reverse/?lat=&lng=` | đăng nhập | `{name, address, lat, lng}` |
 
-`refresh/` và `logout/` dùng chung với khách. Tài khoản tài xế tách riêng với tài khoản
-khách (username `driver:<sđt>`), nên một số điện thoại có thể có cả hai. Tài xế mới được duyệt
-tự động khi `DRIVER_AUTO_APPROVE=True`; nếu không, duyệt trong `/admin`.
+Giới hạn tần suất (mỗi người dùng): estimate 30/phút, đặt xe 10/phút, geo 60/phút,
+vị trí REST 120/phút, chung 300/phút → 429.
 
-## Khách hàng
+## WebSocket `/ws/?token=<access>`
 
-| Method | Đường dẫn | Body | Ghi chú |
-|---|---|---|---|
-| POST | `rides/estimate/` | `{pickup, dropoff}` | `{options: [{vehicle_type, name, seats, fare, route}]}` |
-| POST | `rides/` | `{vehicle_type, pickup:{lat,lng,address}, dropoff:{...}}` | 201 ride `PENDING`, báo tài xế gần nhất |
-| GET | `rides/` | | lịch sử (50 chuyến gần nhất), dùng được cho cả tài xế |
-| GET | `rides/current/` | | `{ride: ... | null}` chuyến đang chạy |
-| GET | `rides/<id>/` | | chi tiết |
-| POST | `rides/<id>/cancel/` | `{reason?}` | khách hủy được khi PENDING/ACCEPTED/ARRIVED |
-| POST | `rides/<id>/rate/` | `{rating: 1-5, comment?}` | sau khi COMPLETED, một lần |
+Token sai / hết hạn → đóng với mã **4401** (làm mới token rồi kết nối lại).
+Sau mỗi lần (re)connect server gửi `connected`; client nên tải lại trạng thái
+(`rides/current/`, `driver/offers/`) vì có thể đã lỡ sự kiện.
 
-Mỗi khách chỉ có một chuyến đang chạy. Giá cước (VND, làm tròn 1.000đ): giá mở cửa cho 2 km
-đầu + giá mỗi km sau đó, giống `mobile/src/lib/mock.ts`:
+Server → client `{"event", "data"}`:
 
-| Loại | Mở cửa | Mỗi km |
+| event | Gửi tới | data |
 |---|---|---|
-| bike | 12.000 | 4.500 |
-| car4 | 25.000 | 9.000 |
-| car7 | 30.000 | 11.000 |
+| `connected` | mọi người | `{user_id}` |
+| `ride.offer` | tài xế | Offer |
+| `ride.offer_cancelled` | tài xế | `{ride_id, offer_id, reason: taken\|cancelled\|expired}` |
+| `ride.updated` | khách + tài xế | Ride (mỗi bên nhận góc nhìn của mình) |
+| `driver.location` | khách | `{ride_id, lat, lng, heading}` |
+| `pong` / `error` | người gửi | – / `{detail}` |
 
-## Tài xế (`/api/driver/`)
-
-| Method | Đường dẫn | Body | Ghi chú |
-|---|---|---|---|
-| PATCH | `status/` | `{status: ONLINE|OFFLINE, lat?, lng?}` | phải được duyệt; không đổi được khi BUSY |
-| POST | `location/` | `{lat, lng}` | dự phòng, nên gửi qua WebSocket |
-| GET | `rides/available/` | | cuốc PENDING cùng loại xe trong bán kính `DRIVER_SEARCH_RADIUS_KM` (5 km) |
-| POST | `rides/<id>/accept/` | | khoá dòng để hai tài xế không nhận trùng; tính `approach_route` |
-| PATCH | `rides/<id>/update-status/` | `{status}` | chỉ đi tiếp từng bước |
-| POST | `/api/rides/<id>/cancel/` | `{reason?}` | tài xế hủy: chuyến về PENDING và gửi lại cho tài xế khác |
-
-Luồng trạng thái:
-
-```
-PENDING -> ACCEPTED -> ARRIVED -> IN_PROGRESS -> COMPLETED
-PENDING / ACCEPTED / ARRIVED -> CANCELLED (khách hủy)
-ACCEPTED / ARRIVED -> PENDING (tài xế hủy)
-```
-
-Trạng thái tài xế: `OFFLINE` -> `ONLINE` -> (nhận cuốc) `BUSY` -> (hoàn thành / bị hủy) `ONLINE`.
-
-## WebSocket
-
-```
-ws://<máy>:8000/ws/?token=<access token>
-```
-
-Token sai/thiếu: đóng với mã `4401`. Access token sống 5 phút, nên khi kết nối lại thì
-refresh token trước. Mỗi tin nhắn từ server có dạng `{"event": "...", "data": {...}}`:
-
-| event | Gửi cho | data |
-|---|---|---|
-| `connected` | người vừa kết nối | `{user_id}` |
-| `ride.requested` | tài xế ONLINE gần điểm đón, đúng loại xe | ride + `distance_to_pickup_m` |
-| `ride.unavailable` | tài xế từng được mời | `{id}` (đã có người nhận / bị hủy) |
-| `ride.updated` | khách và tài xế của chuyến | ride đầy đủ |
-| `driver.location` | khách của chuyến đang chạy | `{ride_id, lat, lng}` |
-| `pong` / `error` | người gửi | |
-
-Client gửi lên:
-
-```json
-{"type": "ping"}
-{"type": "driver.location", "lat": 10.776, "lng": 106.70}
-```
-
-Tài xế nên gửi `driver.location` vài giây một lần khi ONLINE. Server lưu vị trí và, nếu đang
-có chuyến, chuyển ngay cho khách.
-
-Channel layer mặc định là in-memory (một tiến trình server là đủ khi demo). Chạy nhiều tiến
-trình thì đặt `REDIS_URL` và `pip install channels-redis`.
-
-## Bảng dữ liệu (app `core`)
-
-- `core_driverprofile`: tài xế, xe, trạng thái, vị trí hiện tại, điểm đánh giá.
-- `core_ride`: chuyến đi, điểm đón/trả (địa chỉ + toạ độ), quãng đường, giá, trạng thái và
-  thời điểm từng bước, ai hủy, đánh giá.
-- `core_route`: đường đi đã lấy từ Geoapify (cache), `geometry` GeoJSON.
-- `accounts_customer`: khách hàng (đã có từ trước).
+Client → server: `{"type": "ping"}`; tài xế gửi
+`{"type": "driver.location", "lat": …, "lng": …, "heading": …}` (tối đa 1 lần/giây, nên gửi mỗi
+~4 s khi di chuyển và ít nhất mỗi 20 s khi đứng yên để không bị coi là mất GPS).

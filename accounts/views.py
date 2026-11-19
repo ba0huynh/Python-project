@@ -8,11 +8,16 @@ from rest_framework_simplejwt.views import TokenRefreshView
 
 from core.serializers import DriverProfileSerializer
 
+from django.conf import settings
+
+from . import otp as otp_service
 from .models import Customer
 from .serializers import (
     CustomerRefreshSerializer, CustomerSerializer, DriverLoginSerializer, DriverRegisterSerializer,
-    LoginSerializer, LogoutSerializer, RegisterSerializer, ResetPasswordSerializer,
+    LoginSerializer, LogoutSerializer, OTPRequestSerializer, RegisterSerializer, ResetPasswordSerializer,
+    is_registered,
 )
+from .sms import SMSError
 
 
 def auth_response(customer):
@@ -28,6 +33,36 @@ class PublicAuthView(APIView):
     permission_classes = [permissions.AllowAny]
     authentication_classes = []
     throttle_scope = 'auth'
+
+
+class OTPRequestView(PublicAuthView):
+    """POST /api/auth/otp/request/ {phone, purpose: register|reset_password, role} -> SMS a 6-digit code."""
+    throttle_scope = 'otp'
+
+    def post(self, request):
+        serializer = OTPRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        # For password reset, answer the same way whether or not the phone has an
+        # account, but only send an SMS when it does (no account enumeration).
+        send = data['purpose'] == 'register' or is_registered(data['phone'], data['role'])
+        try:
+            if send:
+                otp_service.issue(data['phone'], data['purpose'], data['role'])
+        except otp_service.OTPCooldown as exc:
+            return Response(
+                {'detail': f'Vui lòng đợi {exc.retry_after} giây trước khi gửi lại mã.',
+                 'retry_after': exc.retry_after},
+                status=status.HTTP_429_TOO_MANY_REQUESTS, headers={'Retry-After': str(exc.retry_after)},
+            )
+        except SMSError:
+            return Response({'detail': 'Không gửi được tin nhắn. Vui lòng thử lại sau.'},
+                            status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        return Response({
+            'detail': 'Mã xác thực đã được gửi qua SMS.',
+            'expires_in': settings.OTP_TTL_SECONDS,
+            'resend_in': settings.OTP_RESEND_SECONDS,
+        })
 
 
 class RegisterView(PublicAuthView):
