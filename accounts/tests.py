@@ -19,6 +19,7 @@ def request_otp(client, phone, purpose='register', role='customer'):
     return response, re.search(r'\b(\d{6})\b', send.call_args.args[1]).group(1)
 
 
+@override_settings(OTP_FIXED_CODE='')
 class CustomerAuthTests(APITestCase):
     def setUp(self):
         cache.clear()
@@ -224,7 +225,7 @@ class CustomerAuthTests(APITestCase):
         self.assertIn('otp', res.data)
 
 
-@override_settings(DRIVER_AUTO_APPROVE=False)
+@override_settings(DRIVER_AUTO_APPROVE=False, OTP_FIXED_CODE='')
 class DriverAuthTests(APITestCase):
     def setUp(self):
         cache.clear()
@@ -314,3 +315,12 @@ class AdminRegistrationAndApprovalTests(APITestCase):
         admin_instance.message_user.assert_called_once()
         args, kwargs = admin_instance.message_user.call_args
         self.assertIn("Không có tài xế nào được duyệt", args[1])
+
+
+class FixedOtpTests(APITestCase):
+    @override_settings(OTP_FIXED_CODE='123456')
+    def test_fixed_code_works_and_can_be_resent_immediately(self):
+        cache.clear()
+        for _ in range(2):
+            response, code = request_otp(self.client, '0912345678')
+            self.assertEqual((response.status_code, code), (200, '123456'))

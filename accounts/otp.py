@@ -32,15 +32,16 @@ def _hash(phone, purpose, role, code):
 def issue(phone, purpose, role, send=True) -> PhoneOTP:
     """Create a new code and SMS it. Raises OTPCooldown when asked too often."""
     now = timezone.now()
+    fixed = settings.OTP_FIXED_CODE  # dev only, see settings.py
     recent = PhoneOTP.objects.filter(phone=phone, created_at__gte=now - timedelta(hours=1))
-    if recent.count() >= settings.OTP_MAX_PER_HOUR:
+    if not fixed and recent.count() >= settings.OTP_MAX_PER_HOUR:
         oldest = recent.order_by('created_at').first()
         raise OTPCooldown(int((oldest.created_at + timedelta(hours=1) - now).total_seconds()) + 1)
     last = recent.filter(purpose=purpose, role=role).order_by('-created_at').first()
-    if last and (now - last.created_at).total_seconds() < settings.OTP_RESEND_SECONDS:
+    if not fixed and last and (now - last.created_at).total_seconds() < settings.OTP_RESEND_SECONDS:
         raise OTPCooldown(int(settings.OTP_RESEND_SECONDS - (now - last.created_at).total_seconds()) + 1)
 
-    code = f'{secrets.randbelow(1_000_000):06d}'
+    code = fixed or f'{secrets.randbelow(1_000_000):06d}'
     with transaction.atomic():
         # Only the newest code is valid.
         PhoneOTP.objects.filter(phone=phone, purpose=purpose, role=role, consumed_at__isnull=True).update(
