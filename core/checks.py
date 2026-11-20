@@ -8,7 +8,13 @@ def production_settings(app_configs, **kwargs):
     if settings.DEBUG:
         return []
     issues = []
-    if settings.SMS_BACKEND == 'accounts.sms.ConsoleBackend':
+    if settings.OTP_FIXED_CODE:
+        issues.append(Warning(
+            f'OTP_FIXED_CODE is set: every OTP is {settings.OTP_FIXED_CODE!r}, so anyone can take over accounts.',
+            hint='Set OTP_FIXED_CODE= (empty) and configure SMS_BACKEND before real users sign up.',
+            id='goxe.W004',
+        ))
+    if not settings.OTP_FIXED_CODE and settings.SMS_BACKEND == 'accounts.sms.ConsoleBackend':
         issues.append(Warning(
             'SMS_BACKEND is the console backend: OTP codes are only written to the log.',
             hint='Implement accounts.sms.BaseSMSBackend for your SMS provider and set SMS_BACKEND.',

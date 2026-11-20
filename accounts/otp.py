@@ -32,7 +32,7 @@ def _hash(phone, purpose, role, code):
 def issue(phone, purpose, role, send=True) -> PhoneOTP:
     """Create a new code and SMS it. Raises OTPCooldown when asked too often."""
     now = timezone.now()
-    fixed = settings.OTP_FIXED_CODE  # dev only, see settings.py
+    fixed = settings.OTP_FIXED_CODE  # see settings.py
     recent = PhoneOTP.objects.filter(phone=phone, created_at__gte=now - timedelta(hours=1))
     if not fixed and recent.count() >= settings.OTP_MAX_PER_HOUR:
         oldest = recent.order_by('created_at').first()

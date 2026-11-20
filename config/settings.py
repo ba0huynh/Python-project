@@ -207,9 +207,10 @@ if not DEBUG:
 
 # Phone OTP (sign-up, password reset). SMS_BACKEND: see accounts/sms.py.
 SMS_BACKEND = os.getenv('SMS_BACKEND', 'accounts.sms.ConsoleBackend')
-# Development shortcut: every OTP is this code (default 123456 while DEBUG is on). It is ignored
-# when DEBUG is off, so production always sends random codes.
-OTP_FIXED_CODE = os.getenv('OTP_FIXED_CODE', '123456' if DEBUG else '') if DEBUG else ''
+# Every OTP is this code (no SMS needed). Set OTP_FIXED_CODE= (empty) in .env to send random
+# codes by SMS instead. WARNING: with a fixed code anyone can sign up with or reset the password
+# of any phone number.
+OTP_FIXED_CODE = os.getenv('OTP_FIXED_CODE', '123456')
 OTP_TTL_SECONDS = 300
 OTP_RESEND_SECONDS = 60
 OTP_MAX_PER_HOUR = 5
