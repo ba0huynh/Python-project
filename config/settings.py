@@ -90,9 +90,11 @@ WSGI_APPLICATION = 'config.wsgi.application'
 ASGI_APPLICATION = 'config.asgi.application'
 
 
-# Database: PostgreSQL (DATABASE_URL or DB_* vars). USE_SQLITE=True for quick local work.
+# Database: PostgreSQL (DATABASE_URL or DB_* vars). USE_SQLITE=True for quick local / single-container work.
 if env_bool('USE_SQLITE'):
-    DATABASES = {'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': BASE_DIR / 'db.sqlite3'}}
+    sqlite_path = Path(os.getenv('SQLITE_PATH') or (BASE_DIR / 'db.sqlite3'))
+    sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    DATABASES = {'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': sqlite_path}}
 elif os.getenv('DATABASE_URL'):
     DATABASES = {
         'default': dj_database_url.parse(

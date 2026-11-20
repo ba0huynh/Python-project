@@ -4,7 +4,8 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    SQLITE_PATH=/data/db.sqlite3
 
 WORKDIR /app
 
@@ -16,7 +17,10 @@ COPY . .
 # Static files for /admin (served by WhiteNoise). Settings need a key to import.
 RUN SECRET_KEY=collectstatic-only ALLOWED_HOSTS=localhost python manage.py collectstatic --noinput
 
-RUN useradd --create-home --uid 10001 goxe && chown -R goxe /app
+RUN useradd --create-home --uid 10001 goxe \
+    && mkdir -p /data \
+    && chown -R goxe /app /data
+VOLUME ["/data"]
 USER goxe
 
 EXPOSE 8000
