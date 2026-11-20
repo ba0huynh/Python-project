@@ -37,7 +37,7 @@ if not SECRET_KEY:
 ALLOWED_HOSTS = env_list('ALLOWED_HOSTS', '*' if DEBUG else '')
 if not DEBUG and not ALLOWED_HOSTS:
     raise ImproperlyConfigured('ALLOWED_HOSTS must be set when DEBUG is off.')
-CSRF_TRUSTED_ORIGINS = env_list('CSRF_TRUSTED_ORIGINS')
+CSRF_TRUSTED_ORIGINS = [o for o in env_list('CSRF_TRUSTED_ORIGINS') if o != '*']
 
 
 INSTALLED_APPS = [
@@ -182,8 +182,13 @@ SIMPLE_JWT = {
 }
 
 # CORS: the native app sends no Origin; only browsers (the web build) need this.
-CORS_ALLOWED_ORIGINS = env_list('CORS_ALLOWED_ORIGINS')
-CORS_ALLOW_ALL_ORIGINS = DEBUG and not CORS_ALLOWED_ORIGINS
+_cors_origins = env_list('CORS_ALLOWED_ORIGINS')
+CORS_ALLOW_ALL_ORIGINS = (
+    env_bool('CORS_ALLOW_ALL_ORIGINS', False)
+    or '*' in _cors_origins
+    or (DEBUG and not _cors_origins)
+)
+CORS_ALLOWED_ORIGINS = [o for o in _cors_origins if o != '*']
 CORS_ALLOW_CREDENTIALS = False  # JWT in headers, no cookies
 
 

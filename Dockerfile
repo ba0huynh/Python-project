@@ -27,4 +27,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s \
     CMD python -c "import os, urllib.request; hosts = [h.strip() for h in os.getenv('ALLOWED_HOSTS', '').split(',') if h.strip() and h.strip() != '*']; host = ('health' + hosts[0] if hosts[0].startswith('.') else hosts[0]) if hosts else ''; req = urllib.request.Request('http://127.0.0.1:8000/api/health/', headers={'Host': host} if host else {}); urllib.request.urlopen(req, timeout=4)"
 
+# Run migrations and idempotent seed on every container start/redeploy before starting Daphne.
 CMD ["sh", "-c", "python manage.py migrate --noinput && python manage.py seed --force && exec daphne -b 0.0.0.0 -p 8000 --proxy-headers config.asgi:application"]

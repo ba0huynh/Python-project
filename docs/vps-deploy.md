@@ -73,14 +73,13 @@ Notes from running the backend locally against `.env` and configuring `Dockerfil
    - **Type**: `Volume Mount`
    - **Volume Name**: `goxe-sqlite`
    - **Mount Path**: `/data`
-4. **Application -> Environment**:
+4. **Application -> Environment (School Project / Allow-All Config)**:
 
    ```dotenv
    DEBUG=False
-   SECRET_KEY=<generated-with-secrets.token_urlsafe(50)>
-   ALLOWED_HOSTS=api.example.com
-   CSRF_TRUSTED_ORIGINS=https://api.example.com
-   CORS_ALLOWED_ORIGINS=https://app.example.com
+   SECRET_KEY="django-insecure-3#_8c-92kt*32hu)=@^*6gh7#(-&rz6(#vi7rkxo=$pd9=+pue"
+   ALLOWED_HOSTS=*
+   CORS_ALLOWED_ORIGINS=*
    NUM_PROXIES=1
 
    # Option 1: Persistent SQLite on /data volume (1 replica)
@@ -93,6 +92,12 @@ Notes from running the backend locally against `.env` and configuring `Dockerfil
    GEOAPIFY_API_KEY=<your-geoapify-key>
    SMS_BACKEND=accounts.sms.ConsoleBackend
    ```
+
+   > **Notes on `*` settings**:
+   > - `ALLOWED_HOSTS=*` allows all hosts.
+   > - `CORS_ALLOWED_ORIGINS=*` (or `CORS_ALLOW_ALL_ORIGINS=True`) allows all browser origins even when `DEBUG=False` (`config/settings.py` handles `*` safely without triggering `corsheaders.E014`).
+   > - Leave `CSRF_TRUSTED_ORIGINS` unset (do not set `CSRF_TRUSTED_ORIGINS=*` — Django requires full `https://domain` values, and same-origin `/admin` login over HTTPS works automatically behind Dokploy Traefik via `X-Forwarded-Proto: https`).
+   > - If you access the app over plain `http://` without HTTPS/TLS in Dokploy, also add `SECURE_SSL_REDIRECT=False`.
 
 5. **On every Dokploy deploy/restart**, `Dockerfile` `CMD` automatically runs:
    1. `python manage.py migrate --noinput`
